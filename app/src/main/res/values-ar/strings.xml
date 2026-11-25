@@ -1104,4 +1104,5 @@
     <string name="skip_type_format" formatted="true">تخطي %s</string>
     <string name="home_choose_source_title">اختر مصدر المشاهدة</string>
     <string name="home_choose_source_description">هذا العمل متاح في أكثر من إضافة. اختر الإضافة التي تريد فتحه من خلالها.</string>
+    <string name="home_all_sources_timeout">بعض المصادر لم تستجب في الوقت المحدد. ستظل النتائج التي وصلت متاحة.</string>
 </resources>
