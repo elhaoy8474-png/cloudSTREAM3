@@ -33,6 +33,9 @@ jobs:
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
+      - name: Verify checked-out revision
+        run: git rev-parse HEAD
+
       - name: Build, test and lint
         run: ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :library:jvmTest --stacktrace
 
