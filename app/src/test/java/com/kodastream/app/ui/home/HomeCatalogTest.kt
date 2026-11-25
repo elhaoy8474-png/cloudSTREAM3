@@ -75,7 +75,7 @@ class HomeCatalogTest {
         val unified = mergeHomeRows(
             listOf(
                 HomeRow("a", "Trending", listOf(movie("Film One", "A", "a")), false, 0, 1, true),
-                HomeRow("b", " TRENDING ", listOf(movie("Film One (2020)", "B", "b")), false, 0, 1, true),
+                HomeRow("b", "New Releases", listOf(movie("Film One (2020)", "B", "b")), false, 0, 1, true),
             ),
         )
         assertEquals(1, unified.rows.size)
