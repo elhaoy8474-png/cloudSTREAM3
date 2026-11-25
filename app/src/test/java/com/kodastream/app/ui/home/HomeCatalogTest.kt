@@ -60,6 +60,23 @@ class HomeCatalogTest {
     }
 
     @Test
+    fun minorSpellingDifferencesCanMatchWhenReleaseYearAgrees() {
+        val groups = deduplicateCatalog(
+            listOf(
+                movie("The Last Kingdom", "Source A", "a", 2020),
+                movie("Last Kingdm", "Source B", "b", 2020),
+            ),
+        )
+        assertEquals(1, groups.size)
+        assertEquals(2, groups.single().sources.size)
+    }
+
+    @Test
+    fun arabicDiacriticsDoNotChangeTheNormalizedTitle() {
+        assertEquals(normalizeCatalogTitle("المُدَرِّس"), normalizeCatalogTitle("المدرس"))
+    }
+
+    @Test
     fun unrelatedTitlesAreNotMergedByLooseSubstringMatching() {
         val groups = deduplicateCatalog(
             listOf(
