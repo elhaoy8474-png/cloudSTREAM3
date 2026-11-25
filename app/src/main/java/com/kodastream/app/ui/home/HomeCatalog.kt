@@ -118,14 +118,29 @@ internal fun mergeHomeRows(rows: List<HomeRow>): UnifiedHomeCatalog {
         shelves.getOrPut(key) { mutableListOf() }.add(row)
     }
 
-    val alternatives = linkedMapOf<String, List<SearchResponse>>()
-    val mergedRows = shelves.entries.mapIndexed { index, (key, matchingRows) ->
-        val groups = deduplicateCatalog(matchingRows.flatMap { it.items })
-        groups.forEach { group ->
-            group.sources.forEach { source -> alternatives[source.url] = group.sources }
+    val shelfEntries = shelves.entries.toList()
+    val shelfIndexByUrl = linkedMapOf<String, Int>()
+    shelfEntries.forEachIndexed { index, (_, matchingRows) ->
+        matchingRows.flatMap { it.items }.forEach { item ->
+            shelfIndexByUrl.putIfAbsent(item.url, index)
         }
+    }
+
+    // Cluster globally, not just inside a matching shelf: the same film cannot
+    // reappear under a second provider's differently named Home category.
+    val groupsByShelf = Array(shelfEntries.size) { mutableListOf<CatalogGroup>() }
+    val alternatives = linkedMapOf<String, List<SearchResponse>>()
+    deduplicateCatalog(rows.flatMap { it.items }).forEach { group ->
+        val owner = group.sources.mapNotNull { shelfIndexByUrl[it.url] }.minOrNull() ?: 0
+        groupsByShelf[owner] += group
+        group.sources.forEach { source -> alternatives[source.url] = group.sources }
+    }
+
+    val mergedRows = shelfEntries.mapIndexedNotNull { index, (key, matchingRows) ->
+        val groups = groupsByShelf[index]
+        if (groups.isEmpty()) return@mapIndexedNotNull null
         HomeRow(
-            key = "unified-$index-${key.first}-${key.second}",
+            key = "unified-$index-\${key.first}-\${key.second}",
             title = matchingRows.first().title,
             items = groups.map { it.primary },
             horizontal = key.second,
