@@ -85,6 +85,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -95,7 +97,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import java.util.concurrent.ConcurrentLinkedQueue
+import kotlinx.coroutines.withTimeoutOrNull
 
 @Immutable
 data class HomeRow(
@@ -108,6 +110,11 @@ data class HomeRow(
     /** The last page loaded into [items]. */
     val page: Int,
     val hasNext: Boolean,
+)
+
+private data class HomeCatalogBatch(
+    val rows: List<HomeRow> = emptyList(),
+    val failure: String? = null,
 )
 
 class HomeViewModel(application: Application) : AndroidViewModel(application) {
@@ -195,6 +202,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+
     private fun loadAllSources() {
         loadJob?.cancel()
         val apis = _providers.value.filter { it.hasMainPage }
@@ -212,75 +220,136 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             _rows.value = emptyList()
             _sourceOptions.value = emptyMap()
 
-            val providerRows = arrayOfNulls<List<HomeRow>>(apis.size)
-            val failures = ConcurrentLinkedQueue<String>()
-            // A fixed global limit means 100+ installed extensions do not
-            // create 100+ simultaneous network/plugin requests.
-            val globalGate = Semaphore(2)
+            val accumulator = HomeCatalogAccumulator()
+            var lastFailure: String? = null
 
-            coroutineScope {
-                apis.forEachIndexed { providerIndex, api ->
-                    launch {
-                        try {
-                            val pages = api.mainPage
-                            val pageRows = arrayOfNulls<List<HomeRow>>(pages.size)
-                            val pageGate = Semaphore(if (api.sequentialMainPage) 1 else 2)
+            // Keep a small, fixed number of plugin calls in flight regardless
+            // of whether 8, 80, or 800 extensions are installed.
+            val globalGate = Semaphore(4)
 
-                            coroutineScope {
-                                pages.forEachIndexed { pageIndex, page ->
-                                    launch {
-                                        globalGate.withPermit {
-                                            pageGate.withPermit {
-                                                try {
-                                                    Engine.mainPage(api, page).fold(
-                                                        onSuccess = { response ->
-                                                            pageRows[pageIndex] = response.lists
-                                                                .filter { it.list.isNotEmpty() }
-                                                                .mapIndexed { rowIndex, list ->
-                                                                    HomeRow(
-                                                                        key = "${api.name}-${pageIndex}-${rowIndex}-${list.name}",
-                                                                        title = list.name.ifBlank { page.name },
-                                                                        items = list.list,
-                                                                        horizontal = list.isHorizontalImages,
-                                                                        pageIndex = pageIndex,
-                                                                        page = 1,
-                                                                        hasNext = response.hasNext,
+            // Stop waiting forever for a provider that never returns. Results
+            // already displayed remain available when this overall deadline ends.
+            val completed = withTimeoutOrNull(90_000L) {
+                coroutineScope {
+                    val batches = Channel<HomeCatalogBatch>(Channel.BUFFERED)
+                    val producers = apis.mapIndexed { providerIndex, api ->
+                        launch {
+                            try {
+                                val pages = api.mainPage
+                                val pageGate = Semaphore(if (api.sequentialMainPage) 1 else 2)
+
+                                coroutineScope {
+                                    pages.forEachIndexed { pageIndex, page ->
+                                        launch {
+                                            globalGate.withPermit {
+                                                pageGate.withPermit {
+                                                    try {
+                                                        val result = withTimeoutOrNull(18_000L) {
+                                                            Engine.mainPage(api, page)
+                                                        }
+
+                                                        if (result == null) {
+                                                            batches.send(
+                                                                HomeCatalogBatch(
+                                                                    failure = api.name + ": main page timed out",
+                                                                ),
+                                                            )
+                                                        } else {
+                                                            result.fold(
+                                                                onSuccess = { response ->
+                                                                    val pageRows = response.lists
+                                                                        .filter { it.list.isNotEmpty() }
+                                                                        .mapIndexed { rowIndex, list ->
+                                                                            HomeRow(
+                                                                                key = providerIndex.toString() + "-" +
+                                                                                    api.name + "-" + pageIndex + "-" +
+                                                                                    rowIndex + "-" + list.name,
+                                                                                title = list.name.ifBlank { page.name },
+                                                                                items = list.list,
+                                                                                horizontal = list.isHorizontalImages,
+                                                                                pageIndex = pageIndex,
+                                                                                page = 1,
+                                                                                hasNext = response.hasNext,
+                                                                            )
+                                                                        }
+                                                                    if (pageRows.isNotEmpty()) {
+                                                                        batches.send(HomeCatalogBatch(rows = pageRows))
+                                                                    }
+                                                                },
+                                                                onFailure = { failure ->
+                                                                    batches.send(
+                                                                        HomeCatalogBatch(
+                                                                            failure = api.name + ": " + failure.readableMessage(),
+                                                                        ),
                                                                     )
-                                                                }
-                                                        },
-                                                        onFailure = { failures.add(it.readableMessage()) },
-                                                    )
-                                                } catch (cancelled: CancellationException) {
-                                                    throw cancelled
-                                                } catch (failure: Throwable) {
-                                                    failures.add("${api.name}: ${failure.message ?: failure::class.java.simpleName}")
+                                                                },
+                                                            )
+                                                        }
+                                                    } catch (cancelled: CancellationException) {
+                                                        throw cancelled
+                                                    } catch (failure: Exception) {
+                                                        batches.send(
+                                                            HomeCatalogBatch(
+                                                                failure = api.name + ": " +
+                                                                    (failure.message ?: failure::class.java.simpleName),
+                                                            ),
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (failure: Exception) {
+                                // A broken extension is isolated from all other providers.
+                                batches.send(
+                                    HomeCatalogBatch(
+                                        failure = api.name + ": " +
+                                            (failure.message ?: failure::class.java.simpleName),
+                                    ),
+                                )
                             }
-                            providerRows[providerIndex] = pageRows.filterNotNull().flatten()
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (failure: Throwable) {
-                            // A broken extension must not cancel every other provider.
-                            failures.add("${api.name}: ${failure.message ?: failure::class.java.simpleName}")
-                            providerRows[providerIndex] = emptyList()
                         }
                     }
-                }
-            }
 
-            val allRows = providerRows.filterNotNull().flatten()
-            val unified = withContext(Dispatchers.Default) {
-                mergeHomeRows(allRows)
-            }
-            _rows.value = unified.rows
-            _sourceOptions.value = unified.sourcesByUrl
+                    launch {
+                        producers.joinAll()
+                        batches.close()
+                    }
+
+                    // Consume results as soon as any provider/page responds.
+                    // Several queued results are merged together into one UI update.
+                    var nextBatch = batches.receiveCatching().getOrNull()
+                    while (nextBatch != null) {
+                        val incomingRows = mutableListOf<HomeRow>()
+                        var current: HomeCatalogBatch? = nextBatch
+                        while (current != null) {
+                            current.failure?.let { lastFailure = it }
+                            incomingRows += current.rows
+                            current = batches.tryReceive().getOrNull()
+                        }
+
+                        if (incomingRows.isNotEmpty()) {
+                            val snapshot = withContext(Dispatchers.Default) {
+                                accumulator.add(incomingRows)
+                                accumulator.snapshot()
+                            }
+                            _rows.value = snapshot.rows
+                            _sourceOptions.value = snapshot.sourcesByUrl
+                        }
+
+                        nextBatch = batches.receiveCatching().getOrNull()
+                    }
+                }
+                true
+            } ?: false
 
             _loading.value = false
-            if (_rows.value.isEmpty()) _error.value = failures.peek() ?: ""
+            if (_rows.value.isEmpty()) {
+                _error.value = lastFailure ?: if (!completed) "" else ""
+            }
         }
     }
 
