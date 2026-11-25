@@ -58,27 +58,48 @@ private fun releaseYear(item: SearchResponse): Int? {
     return declared ?: Regex("\\b(19|20)\\d{2}\\b").find(item.name)?.value?.toIntOrNull()
 }
 
+private fun editSimilarity(left: String, right: String): Double {
+    if (left == right) return 1.0
+    if (left.isEmpty() || right.isEmpty()) return 0.0
+    var previous = IntArray(right.length + 1) { it }
+    for (i in left.indices) {
+        val current = IntArray(right.length + 1)
+        current[0] = i + 1
+        for (j in right.indices) {
+            val cost = if (left[i] == right[j]) 0 else 1
+            current[j + 1] = minOf(
+                current[j] + 1,
+                previous[j + 1] + 1,
+                previous[j] + cost,
+            )
+        }
+        previous = current
+    }
+    return 1.0 - previous[right.length].toDouble() / maxOf(left.length, right.length)
+}
+
 private fun titleSimilarity(left: String, right: String): Double {
     if (left == right) return 1.0
     if (left.isBlank() || right.isBlank()) return 0.0
 
-    val leftTokens = left.split(' ').toSet()
-    val rightTokens = right.split(' ').toSet()
-    val tokenUnion = leftTokens union rightTokens
-    val tokenScore = if (tokenUnion.isEmpty()) 0.0 else {
-        (leftTokens intersect rightTokens).size.toDouble() / tokenUnion.size
+    val leftTokens = left.split(' ').filter { it.isNotBlank() }
+    val unmatchedRight = right.split(' ').filter { it.isNotBlank() }.toMutableList()
+    var tokenScore = 0.0
+    leftTokens.forEach { token ->
+        val best = unmatchedRight.maxByOrNull { editSimilarity(token, it) } ?: return@forEach
+        val similarity = editSimilarity(token, best)
+        if (similarity >= 0.60) {
+            tokenScore += similarity
+            unmatchedRight.remove(best)
+        }
     }
-
-    fun bigrams(value: String): Set<String> =
-        if (value.length < 2) setOf(value) else (0 until value.length - 1).map { value.substring(it, it + 2) }.toSet()
-
-    val leftPairs = bigrams(left)
-    val rightPairs = bigrams(right)
-    val pairCount = leftPairs.size + rightPairs.size
-    val pairScore = if (pairCount == 0) 0.0 else {
-        2.0 * (leftPairs intersect rightPairs).size / pairCount
+    val tokenF1 = if (leftTokens.isEmpty() && unmatchedRight.isEmpty()) {
+        1.0
+    } else {
+        2.0 * tokenScore / (leftTokens.size + right.split(' ').count { it.isNotBlank() })
     }
-    return tokenScore * 0.55 + pairScore * 0.45
+    val characterScore = editSimilarity(left.replace(" ", ""), right.replace(" ", ""))
+    return tokenF1 * 0.55 + characterScore * 0.45
 }
 
 private fun sameWork(left: SearchResponse, right: SearchResponse): Boolean {
@@ -89,7 +110,7 @@ private fun sameWork(left: SearchResponse, right: SearchResponse): Boolean {
 
     val leftTitle = normalizeCatalogTitle(left.name)
     val rightTitle = normalizeCatalogTitle(right.name)
-    val threshold = if (leftYear != null && rightYear != null) 0.88 else 0.94
+    val threshold = if (leftYear != null && rightYear != null) 0.88 else 0.92
     return titleSimilarity(leftTitle, rightTitle) >= threshold
 }
 
