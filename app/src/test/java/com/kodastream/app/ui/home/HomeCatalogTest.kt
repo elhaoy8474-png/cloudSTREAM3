@@ -117,7 +117,9 @@ class HomeCatalogTest {
             HomeRow("provider-$provider", "Shelf $provider", items, false, 0, 1, false)
         }
 
-        val unified = mergeHomeRows(rows)
+        val accumulator = HomeCatalogAccumulator()
+        rows.forEach { row -> accumulator.add(listOf(row)) }
+        val unified = accumulator.snapshot()
 
         assertEquals(1200, unified.rows.sumOf { it.items.size })
         assertEquals(1200, unified.sourcesByUrl.size)
