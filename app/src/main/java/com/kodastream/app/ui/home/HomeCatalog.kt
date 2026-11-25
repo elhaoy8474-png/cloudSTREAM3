@@ -164,11 +164,6 @@ internal fun deduplicateCatalog(items: List<SearchResponse>): List<CatalogGroup>
 }
 
 /**
- * Combine similarly named shelves from all extensions, then expose each work
- * once in that shelf while retaining every provider URL for the source chooser.
- */
-
-/**
  * Stateful incremental catalogue merger.
  *
  * New provider/page results are indexed once and merged into existing groups.
@@ -185,7 +180,6 @@ internal class HomeCatalogAccumulator {
 
     private val shelves = linkedMapOf<ShelfKey, ShelfData>()
     private val groups = mutableListOf<MutableList<SearchResponse>>()
-    private val ownerShelfByGroup = mutableListOf<ShelfKey>()
     private val candidatesByNgram = HashMap<String, MutableList<Int>>()
 
     fun add(rows: List<HomeRow>) {
@@ -212,7 +206,6 @@ internal class HomeCatalogAccumulator {
                 if (existingIndex == null) {
                     val newIndex = groups.size
                     groups += mutableListOf(item)
-                    ownerShelfByGroup += shelfKey
                     shelf.groupIndexes += newIndex
                     titleNgrams(title).forEach { gram ->
                         candidatesByNgram.getOrPut(gram) { mutableListOf() }.add(newIndex)
@@ -228,12 +221,6 @@ internal class HomeCatalogAccumulator {
     }
 
     fun snapshot(): UnifiedHomeCatalog {
-        val groupsByShelf = HashMap<ShelfKey, MutableList<List<SearchResponse>>>()
-        groups.indices.forEach { index ->
-            groupsByShelf.getOrPut(ownerShelfByGroup[index]) { mutableListOf() }
-                .add(groups[index].toList())
-        }
-
         val alternatives = linkedMapOf<String, List<SearchResponse>>()
         groups.forEach { group ->
             val sources = group.toList()
@@ -241,7 +228,7 @@ internal class HomeCatalogAccumulator {
         }
 
         val mergedRows = shelves.mapNotNull { (key, shelf) ->
-            val shelfGroups = groupsByShelf[key].orEmpty()
+            val shelfGroups = shelf.groupIndexes.map { groups[it].toList() }
             if (shelfGroups.isEmpty()) {
                 null
             } else {
