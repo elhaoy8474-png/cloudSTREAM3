@@ -1,7 +1,11 @@
 package com.kodastream.app.ui.home
 
+import com.kodastream.app.engine.Engine
 import com.lagradost.cloudstream3.AnimeSearchResponse
 import com.lagradost.cloudstream3.DubStatus
+import com.lagradost.cloudstream3.HomePageList
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageData
 import com.lagradost.cloudstream3.MovieSearchResponse
 import com.lagradost.cloudstream3.TvSeriesSearchResponse
 import com.lagradost.cloudstream3.TvType
@@ -235,6 +239,46 @@ class HomeCatalogTest {
         assertTrue(HomeCategoryIds.MOVIES in ids)
         assertFalse(HomeCategoryIds.FOREIGN_MOVIES in ids)
         assertFalse(HomeCategoryIds.ARABIC_MOVIES in ids)
+    }
+
+    @Test
+    fun firstVisibleDuplicateKeepsItsCardAndOrderWhenEarlierProviderRepliesLater() {
+        fun provider(name: String) = object : MainAPI() {
+            init {
+                this.name = name
+                mainUrl = "https://$name.example"
+                sourcePlugin = "test/$name"
+                lang = "en"
+            }
+            override val hasMainPage = true
+            override val mainPage = listOf(MainPageData("Movies", "/movies"))
+        }
+
+        val sources = createHomePageSources(listOf(provider("First"), provider("Second")))
+        val accumulator = UnifiedHomeCatalogAccumulator()
+        accumulator.addPage(
+            sources[1],
+            Engine.MainPageResult(
+                listOf(HomePageList("Movies", listOf(movie("Same Film", "Second", "second")))),
+                false,
+            ),
+        )
+        val firstSnapshot = accumulator.snapshot()
+        assertEquals("Second", firstSnapshot.rows.first().items.first().apiName)
+
+        accumulator.addPage(
+            sources[0],
+            Engine.MainPageResult(
+                listOf(HomePageList("Movies", listOf(movie("Same Film", "First", "first")))),
+                false,
+            ),
+        )
+        val updated = accumulator.snapshot()
+        assertEquals("Second", updated.rows.first().items.first().apiName)
+        assertEquals(
+            listOf("Second", "First"),
+            updated.sourcesByUrl.getValue("second").map { it.apiName },
+        )
     }
 
 }

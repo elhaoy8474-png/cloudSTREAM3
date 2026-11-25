@@ -354,9 +354,13 @@ internal class UnifiedHomeCatalogAccumulator {
 
     private val buckets = linkedMapOf<String, CategoryBucket>()
     private val sources = linkedMapOf<String, SourceState>()
+    private var nextArrivalOrder = 0
 
     fun addPage(source: HomePageSource, response: Engine.MainPageResult) {
         val observedCategories = linkedSetOf<String>()
+        // A card keeps the order and representation of the first result shown.
+        // Later duplicates enrich its alternatives; they never move the card.
+        val arrivalOrder = nextArrivalOrder++
         response.lists.forEachIndexed { listIndex, pageList ->
             pageList.list.forEachIndexed { itemIndex, item ->
                 val categories = homeCategoryIdsFor(
@@ -367,7 +371,7 @@ internal class UnifiedHomeCatalogAccumulator {
                 observedCategories += categories
                 val entry = RankedSearchResponse(
                     item = item,
-                    order = CatalogOrder(source.providerOrder, source.requestIndex, listIndex, itemIndex),
+                    order = CatalogOrder(arrivalOrder, source.requestIndex, listIndex, itemIndex),
                 )
                 categories.forEach { categoryId ->
                     buckets.getOrPut(categoryId) { CategoryBucket() }.add(entry)
