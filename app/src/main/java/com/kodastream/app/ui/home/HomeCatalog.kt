@@ -32,7 +32,7 @@ internal fun normalizeCatalogTitle(value: String): String {
         .trim()
         .replace(Regex("\\s+"), " ")
     val tokens = normalized.split(' ').filter { it.isNotBlank() }
-    val titleTokens = if (tokens.firstOrNull() in setOf("the", "a", "an")) {
+    val titleTokens = if (tokens.firstOrNull()?.let { it == "the" || it == "a" || it == "an" } == true) {
         tokens.drop(1)
     } else {
         tokens
