@@ -164,7 +164,7 @@ internal fun mergeHomeRows(rows: List<HomeRow>): UnifiedHomeCatalog {
         val groups = groupsByShelf[index]
         if (groups.isEmpty()) return@mapIndexedNotNull null
         HomeRow(
-            key = "unified-$index-\${key.first}-\${key.second}",
+            key = "unified-$index-${key.first}-${key.second}",
             title = matchingRows.first().title,
             items = groups.map { it.primary },
             horizontal = key.second,
