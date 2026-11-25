@@ -97,7 +97,6 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicInteger
 
 @Immutable
@@ -267,9 +266,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             sources.forEach { source ->
                 workerScope.launch {
                     try {
-                        val result = withTimeoutOrNull(18_000L) {
-                            source.loadPage(1)
-                        } ?: Result.failure(IllegalStateException("Main page timed out"))
+                        val result = source.loadPage(1)
                         batches.trySend(HomeCatalogBatch(source, result))
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -345,9 +342,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             coroutineScope {
                 pages.forEachIndexed { index, source ->
                     launch {
-                        val result = withTimeoutOrNull(18_000L) {
-                            source.loadPage(1)
-                        } ?: Result.failure(IllegalStateException("Main page timed out"))
+                        val result = source.loadPage(1)
                         result.onSuccess { response ->
                             if (generation == loadGeneration) {
                                 results[index] = response.lists

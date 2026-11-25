@@ -14,6 +14,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.LinkedHashMap
 import java.util.Locale
 
@@ -88,8 +89,10 @@ class HomePageSource(
                     providerGate.withPermit {
                         val waitMs = if (pageNumber == 1) api.sequentialMainPageDelay
                         else api.sequentialMainPageScrollDelay
-                        if (waitMs > 0L) delay(waitMs)
-                        Engine.mainPage(api, pageData, pageNumber)
+                        withTimeoutOrNull(12_000L) {
+                            if (waitMs > 0L) delay(waitMs)
+                            Engine.mainPage(api, pageData, pageNumber)
+                        } ?: Result.failure(IllegalStateException("Main page timed out"))
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -120,7 +123,7 @@ data class HomePageCursor(
 
 /** One cursor per source request and category; the fetched page itself is cached per source. */
 internal fun createHomePageSources(apis: List<MainAPI>): List<HomePageSource> {
-    val globalGate = Semaphore(8)
+    val globalGate = Semaphore(12)
     val providerGates = HashMap<String, Semaphore>()
     return apis.flatMapIndexed { providerOrder, api ->
         val providerKey = listOf(

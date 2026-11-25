@@ -13,7 +13,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 fun sectionKey(provider: String, rowKey: String): String = "$provider|$rowKey"
 
@@ -191,8 +190,10 @@ class ExpandedHomeViewModel : ViewModel() {
         }
 
         activeWatchdogs.remove(key)?.cancel()
+        val watchdogBudgetMs = (((targets.size + 11) / 12) * 12_000L + 5_000L)
+            .coerceAtMost(95_000L)
         val watchdog = viewModelScope.launch {
-            kotlinx.coroutines.delay(25_000L)
+            kotlinx.coroutines.delay(watchdogBudgetMs)
             val latest = _sections.value[key]
             if (latest != null && latest.requestId == requestId && latest.loading) {
                 activeJobs[key]?.forEach { it.cancel() }
@@ -226,9 +227,7 @@ class ExpandedHomeViewModel : ViewModel() {
         val jobs = targets.map { cursor ->
             viewModelScope.launch(start = CoroutineStart.LAZY) {
                 val result = try {
-                    withTimeoutOrNull(20_000L) {
-                        cursor.source.loadPage(cursor.nextPage)
-                    } ?: Result.failure(IllegalStateException("Source page timed out"))
+                    cursor.source.loadPage(cursor.nextPage)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Throwable) {
