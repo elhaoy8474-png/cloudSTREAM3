@@ -1199,4 +1199,6 @@
     <string name="player_preferred_audio_lang_summary">Default language track when multiple are available</string>
     <string name="player_subtitles_style">Subtitle appearance</string>
     <string name="player_subtitles_style_summary">Customize subtitle font, size, colors, and background</string>
+    <string name="home_choose_source_title">Choose a source</string>
+    <string name="home_choose_source_description">This title is available from more than one extension. Choose where to open it.</string>
 </resources>
