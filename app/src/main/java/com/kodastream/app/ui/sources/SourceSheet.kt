@@ -64,6 +64,10 @@ class SourceViewModel(application: Application) : AndroidViewModel(application) 
     private val _home = MutableStateFlow<String?>(null)
     val home: StateFlow<String?> = _home.asStateFlow()
 
+    /** A null saved provider means the unified catalogue, not the first extension. */
+    private val _homeAll = MutableStateFlow(saved == null)
+    val homeAll: StateFlow<Boolean> = _homeAll.asStateFlow()
+
     /** null means every provider, the same meaning the Search chips had. */
     private val _search = MutableStateFlow<String?>(null)
     val search: StateFlow<String?> = _search.asStateFlow()
@@ -97,10 +101,18 @@ class SourceViewModel(application: Application) : AndroidViewModel(application) 
     fun selectHome(name: String) {
         val api = Engine.provider(name) ?: return
         if (!api.hasMainPage) return
+        _homeAll.value = false
         picked = name
         saved = name
         AppPrefs.setSelectedProvider(getApplication(), name)
         if (_home.value != name) _home.value = name
+    }
+
+    fun selectAllHomeSources() {
+        _homeAll.value = true
+        picked = null
+        saved = null
+        AppPrefs.setSelectedProvider(getApplication(), null)
     }
 
     fun selectSearch(name: String?) {
@@ -117,6 +129,7 @@ fun SourceSheet(
     onSelect: (String?) -> Unit,
     onOpenExtensions: () -> Unit,
     onDismiss: () -> Unit,
+    allowProvidersWithoutHome: Boolean = false,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
@@ -155,7 +168,7 @@ fun SourceSheet(
                     }
                     items(providers, key = { it.name }) { api ->
                         // Search can use every provider; Home needs a main page.
-                        val canFillHome = showAllSources || api.hasMainPage
+                        val canFillHome = allowProvidersWithoutHome || api.hasMainPage
                         SourceRow(
                             name = api.name,
                             selected = selected == api.name,
