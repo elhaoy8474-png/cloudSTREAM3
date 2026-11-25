@@ -31,9 +31,13 @@ internal fun normalizeCatalogTitle(value: String): String {
         .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
         .trim()
         .replace(Regex("\\s+"), " ")
-    return normalized.split(' ')
-        .filterNot { it.isBlank() || it == "the" || it == "a" || it == "an" }
-        .joinToString(" ")
+    val tokens = normalized.split(' ').filter { it.isNotBlank() }
+    val titleTokens = if (tokens.firstOrNull() in setOf("the", "a", "an")) {
+        tokens.drop(1)
+    } else {
+        tokens
+    }
+    return titleTokens.joinToString(" ")
 }
 
 private fun mediaFamily(item: SearchResponse): String = when (item.type) {
