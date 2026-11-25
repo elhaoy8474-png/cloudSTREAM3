@@ -26,8 +26,8 @@ internal fun normalizeCatalogTitle(value: String): String {
         .lowercase(Locale.ROOT)
         .replace(Regex("\\p{M}+"), "")
         .replace(Regex("[\\u064B-\\u065F\\u0670\\u0640]"), "")
-        .replace(Regex("\\b(19|20)\\d{2}\\b"), " ")
         .replace(Regex("\\b(2160p|1440p|1080p|720p|480p|4k|8k|hdrip|webrip|web-dl|bluray|brrip|hdtv)\\b"), " ")
+        .replace(Regex("""(?:\\s|\\(|\\[)+(?:19|20)\\d{2}[\\)\\]]*\\s*$"""), " ")
         .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
         .trim()
         .replace(Regex("\\s+"), " ")
@@ -55,7 +55,12 @@ private fun releaseYear(item: SearchResponse): Int? {
         is AnimeSearchResponse -> item.year
         else -> null
     }
-    return declared ?: Regex("\\b(19|20)\\d{2}\\b").find(item.name)?.value?.toIntOrNull()
+    val trailingYear = Regex("""(?:\\s|\\(|\\[)+((?:19|20)\\d{2})[\\)\\]]*\\s*$""")
+        .find(item.name)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+    return declared ?: trailingYear
 }
 
 private fun editSimilarity(left: String, right: String): Double {
