@@ -85,8 +85,10 @@ class HomePageSource(
         try {
             pageCache[pageNumber]?.let { return Result.success(it) }
             val result = try {
-                globalGate.withPermit {
-                    providerGate.withPermit {
+                providerGate.withPermit {
+                    // Never occupy a global network slot while waiting for this
+                    // provider's own concurrency limit.
+                    globalGate.withPermit {
                         val waitMs = if (pageNumber == 1) api.sequentialMainPageDelay
                         else api.sequentialMainPageScrollDelay
                         withTimeoutOrNull(12_000L) {
