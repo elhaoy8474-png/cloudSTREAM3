@@ -1201,4 +1201,5 @@
     <string name="player_subtitles_style_summary">Customize subtitle font, size, colors, and background</string>
     <string name="home_choose_source_title">Choose a source</string>
     <string name="home_choose_source_description">This title is available from more than one extension. Choose where to open it.</string>
+    <string name="home_all_sources_timeout">Some sources did not respond in time. The results received so far are still available.</string>
 </resources>
