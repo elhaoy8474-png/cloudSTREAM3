@@ -48,11 +48,14 @@ private fun mediaFamily(item: SearchResponse): String = when (item.type) {
     TvType.Others, null -> "other"
 }
 
-private fun releaseYear(item: SearchResponse): Int? = when (item) {
-    is MovieSearchResponse -> item.year
-    is TvSeriesSearchResponse -> item.year
-    is AnimeSearchResponse -> item.year
-    else -> Regex("\\b(19|20)\\d{2}\\b").find(item.name)?.value?.toIntOrNull()
+private fun releaseYear(item: SearchResponse): Int? {
+    val declared = when (item) {
+        is MovieSearchResponse -> item.year
+        is TvSeriesSearchResponse -> item.year
+        is AnimeSearchResponse -> item.year
+        else -> null
+    }
+    return declared ?: Regex("\\b(19|20)\\d{2}\\b").find(item.name)?.value?.toIntOrNull()
 }
 
 private fun titleSimilarity(left: String, right: String): Double {
