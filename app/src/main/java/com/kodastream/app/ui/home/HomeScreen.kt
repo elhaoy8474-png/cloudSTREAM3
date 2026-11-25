@@ -81,6 +81,8 @@ import com.kodastream.app.ui.theme.ArtworkStatusBarIcons
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.plugins.PluginManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -92,6 +94,8 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentLinkedQueue
 
 @Immutable
 data class HomeRow(
@@ -209,59 +213,74 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             _sourceOptions.value = emptyMap()
 
             val providerRows = arrayOfNulls<List<HomeRow>>(apis.size)
-            var lastFailure: String? = null
-            val globalGate = Semaphore(4)
+            val failures = ConcurrentLinkedQueue<String>()
+            // A fixed global limit means 100+ installed extensions do not
+            // create 100+ simultaneous network/plugin requests.
+            val globalGate = Semaphore(2)
 
             coroutineScope {
                 apis.forEachIndexed { providerIndex, api ->
                     launch {
-                        val pages = api.mainPage
-                        val pageRows = arrayOfNulls<List<HomeRow>>(pages.size)
-                        val pageGate = Semaphore(if (api.sequentialMainPage) 1 else 3)
+                        try {
+                            val pages = api.mainPage
+                            val pageRows = arrayOfNulls<List<HomeRow>>(pages.size)
+                            val pageGate = Semaphore(if (api.sequentialMainPage) 1 else 2)
 
-                        coroutineScope {
-                            pages.forEachIndexed { pageIndex, page ->
-                                launch {
-                                    globalGate.withPermit {
-                                        pageGate.withPermit {
-                                            Engine.mainPage(api, page).fold(
-                                                onSuccess = { response ->
-                                                    pageRows[pageIndex] = response.lists
-                                                        .filter { it.list.isNotEmpty() }
-                                                        .mapIndexed { rowIndex, list ->
-                                                            HomeRow(
-                                                                key = "${api.name}-${pageIndex}-${rowIndex}-${list.name}",
-                                                                title = list.name.ifBlank { page.name },
-                                                                items = list.list,
-                                                                horizontal = list.isHorizontalImages,
-                                                                pageIndex = pageIndex,
-                                                                page = 1,
-                                                                hasNext = response.hasNext,
-                                                            )
-                                                        }
-                                                },
-                                                onFailure = { lastFailure = it.readableMessage() },
-                                            )
+                            coroutineScope {
+                                pages.forEachIndexed { pageIndex, page ->
+                                    launch {
+                                        globalGate.withPermit {
+                                            pageGate.withPermit {
+                                                try {
+                                                    Engine.mainPage(api, page).fold(
+                                                        onSuccess = { response ->
+                                                            pageRows[pageIndex] = response.lists
+                                                                .filter { it.list.isNotEmpty() }
+                                                                .mapIndexed { rowIndex, list ->
+                                                                    HomeRow(
+                                                                        key = "${api.name}-${pageIndex}-${rowIndex}-${list.name}",
+                                                                        title = list.name.ifBlank { page.name },
+                                                                        items = list.list,
+                                                                        horizontal = list.isHorizontalImages,
+                                                                        pageIndex = pageIndex,
+                                                                        page = 1,
+                                                                        hasNext = response.hasNext,
+                                                                    )
+                                                                }
+                                                        },
+                                                        onFailure = { failures.add(it.readableMessage()) },
+                                                    )
+                                                } catch (cancelled: CancellationException) {
+                                                    throw cancelled
+                                                } catch (failure: Throwable) {
+                                                    failures.add("${api.name}: ${failure.message ?: failure::class.java.simpleName}")
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
+                            providerRows[providerIndex] = pageRows.filterNotNull().flatten()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (failure: Throwable) {
+                            // A broken extension must not cancel every other provider.
+                            failures.add("${api.name}: ${failure.message ?: failure::class.java.simpleName}")
+                            providerRows[providerIndex] = emptyList()
                         }
-
-                        providerRows[providerIndex] = pageRows.filterNotNull().flatten()
                     }
                 }
             }
 
-            // Merge once after every provider has completed. Rebuilding the full
-            // fuzzy-deduplicated catalogue after each provider multiplies CPU and
-            // allocation pressure on devices with many installed extensions.
-            val unified = mergeHomeRows(providerRows.filterNotNull().flatten())
+            val allRows = providerRows.filterNotNull().flatten()
+            val unified = withContext(Dispatchers.Default) {
+                mergeHomeRows(allRows)
+            }
             _rows.value = unified.rows
             _sourceOptions.value = unified.sourcesByUrl
 
             _loading.value = false
-            if (_rows.value.isEmpty()) _error.value = lastFailure ?: ""
+            if (_rows.value.isEmpty()) _error.value = failures.peek() ?: ""
         }
     }
 
