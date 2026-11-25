@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Row as ComposeRow
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -656,7 +656,7 @@ private fun HomeSourceChooser(
                         color = MaterialTheme.colorScheme.surfaceContainer,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
                     ) {
-                        Row(
+                        ComposeRow(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
