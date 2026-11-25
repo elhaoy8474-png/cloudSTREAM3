@@ -127,14 +127,37 @@ private fun sameWork(left: SearchResponse, right: SearchResponse): Boolean {
  * Conservative, deterministic clustering. Exact names are cheap; fuzzy matches
  * require a high score and compatible media type/year to avoid merging remakes.
  */
+private fun titleNgrams(value: String): Set<String> {
+    if (value.length < 3) return setOf(value)
+    return (0..value.length - 3).mapTo(linkedSetOf()) { value.substring(it, it + 3) }
+}
+
 internal fun deduplicateCatalog(items: List<SearchResponse>): List<CatalogGroup> {
+    // Index likely fuzzy matches instead of comparing every item with every
+    // existing group. This keeps large multi-extension catalogues practical.
     val groups = mutableListOf<MutableList<SearchResponse>>()
-    items.filter { it.url.isNotBlank() }.forEach { item ->
-        val existing = groups.firstOrNull { group -> sameWork(group.first(), item) }
-        if (existing == null) {
+    val candidatesByNgram = HashMap<String, MutableList<Int>>()
+    items.asSequence().filter { it.url.isNotBlank() }.forEach { item ->
+        val title = normalizeCatalogTitle(item.name)
+        val candidates = linkedSetOf<Int>()
+        titleNgrams(title).forEach { gram ->
+            candidatesByNgram[gram]?.let(candidates::addAll)
+        }
+        val existingIndex = candidates.firstOrNull { index ->
+            sameWork(groups[index].first(), item)
+        }
+
+        if (existingIndex == null) {
+            val index = groups.size
             groups += mutableListOf(item)
-        } else if (existing.none { it.apiName == item.apiName && it.url == item.url }) {
-            existing += item
+            titleNgrams(title).forEach { gram ->
+                candidatesByNgram.getOrPut(gram) { mutableListOf() }.add(index)
+            }
+        } else {
+            val existing = groups[existingIndex]
+            if (existing.none { it.apiName == item.apiName && it.url == item.url }) {
+                existing += item
+            }
         }
     }
     return groups.map { group -> CatalogGroup(group.first(), group.toList()) }
