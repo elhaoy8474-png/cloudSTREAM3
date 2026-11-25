@@ -167,44 +167,99 @@ internal fun deduplicateCatalog(items: List<SearchResponse>): List<CatalogGroup>
  * Combine similarly named shelves from all extensions, then expose each work
  * once in that shelf while retaining every provider URL for the source chooser.
  */
-internal fun mergeHomeRows(rows: List<HomeRow>): UnifiedHomeCatalog {
-    val shelves = linkedMapOf<Pair<String, Boolean>, MutableList<HomeRow>>()
-    rows.forEach { row ->
-        val key = normalizeCatalogTitle(row.title).ifBlank { row.title.lowercase(Locale.ROOT) } to row.horizontal
-        shelves.getOrPut(key) { mutableListOf() }.add(row)
-    }
 
-    val shelfEntries = shelves.entries.toList()
-    val allItems = rows.flatMap { it.items }
-    val shelfIndexByUrl = linkedMapOf<String, Int>()
-    shelfEntries.forEachIndexed { index, (_, matchingRows) ->
-        matchingRows.forEach { row ->
-            row.items.forEach { item -> shelfIndexByUrl.putIfAbsent(item.url, index) }
+/**
+ * Stateful incremental catalogue merger.
+ *
+ * New provider/page results are indexed once and merged into existing groups.
+ * This avoids re-running fuzzy matching over every previously received item
+ * after each provider responds.
+ */
+internal class HomeCatalogAccumulator {
+    private data class ShelfKey(val normalizedTitle: String, val horizontal: Boolean)
+    private data class ShelfData(
+        val title: String,
+        val horizontal: Boolean,
+        val groupIndexes: MutableList<Int> = mutableListOf(),
+    )
+
+    private val shelves = linkedMapOf<ShelfKey, ShelfData>()
+    private val groups = mutableListOf<MutableList<SearchResponse>>()
+    private val ownerShelfByGroup = mutableListOf<ShelfKey>()
+    private val candidatesByNgram = HashMap<String, MutableList<Int>>()
+
+    fun add(rows: List<HomeRow>) {
+        rows.forEach { row ->
+            val normalizedShelf = normalizeCatalogTitle(row.title)
+                .ifBlank { row.title.lowercase(Locale.ROOT) }
+            val shelfKey = ShelfKey(normalizedShelf, row.horizontal)
+            val shelf = shelves.getOrPut(shelfKey) {
+                ShelfData(row.title, row.horizontal)
+            }
+
+            row.items.forEach itemLoop@{ item ->
+                if (item.url.isBlank()) return@itemLoop
+
+                val title = normalizeCatalogTitle(item.name)
+                val candidates = linkedSetOf<Int>()
+                titleNgrams(title).forEach { gram ->
+                    candidatesByNgram[gram]?.let(candidates::addAll)
+                }
+                val existingIndex = candidates.firstOrNull { index ->
+                    sameWork(groups[index].first(), item)
+                }
+
+                if (existingIndex == null) {
+                    val newIndex = groups.size
+                    groups += mutableListOf(item)
+                    ownerShelfByGroup += shelfKey
+                    shelf.groupIndexes += newIndex
+                    titleNgrams(title).forEach { gram ->
+                        candidatesByNgram.getOrPut(gram) { mutableListOf() }.add(newIndex)
+                    }
+                } else {
+                    val existing = groups[existingIndex]
+                    if (existing.none { it.apiName == item.apiName && it.url == item.url }) {
+                        existing += item
+                    }
+                }
+            }
         }
     }
 
-    // Cluster globally, not just inside a matching shelf: the same film cannot
-    // reappear under a second provider's differently named Home category.
-    val groupsByShelf = Array(shelfEntries.size) { mutableListOf<CatalogGroup>() }
-    val alternatives = linkedMapOf<String, List<SearchResponse>>()
-    deduplicateCatalog(allItems).forEach { group ->
-        val owner = group.sources.mapNotNull { shelfIndexByUrl[it.url] }.minOrNull() ?: 0
-        groupsByShelf[owner] += group
-        group.sources.forEach { source -> alternatives[source.url] = group.sources }
-    }
+    fun snapshot(): UnifiedHomeCatalog {
+        val groupsByShelf = HashMap<ShelfKey, MutableList<List<SearchResponse>>>()
+        groups.indices.forEach { index ->
+            groupsByShelf.getOrPut(ownerShelfByGroup[index]) { mutableListOf() }
+                .add(groups[index].toList())
+        }
 
-    val mergedRows = shelfEntries.mapIndexedNotNull { index, (key, matchingRows) ->
-        val groups = groupsByShelf[index]
-        if (groups.isEmpty()) return@mapIndexedNotNull null
-        HomeRow(
-            key = "unified-$index-${key.first}-${key.second}",
-            title = matchingRows.first().title,
-            items = groups.map { it.primary },
-            horizontal = key.second,
-            pageIndex = -1,
-            page = 1,
-            hasNext = false,
-        )
+        val alternatives = linkedMapOf<String, List<SearchResponse>>()
+        groups.forEach { group ->
+            val sources = group.toList()
+            sources.forEach { source -> alternatives[source.url] = sources }
+        }
+
+        val mergedRows = shelves.mapNotNull { (key, shelf) ->
+            val shelfGroups = groupsByShelf[key].orEmpty()
+            if (shelfGroups.isEmpty()) {
+                null
+            } else {
+                HomeRow(
+                    key = "unified-${key.normalizedTitle}-${key.horizontal}",
+                    title = shelf.title,
+                    items = shelfGroups.map { it.first() },
+                    horizontal = shelf.horizontal,
+                    pageIndex = -1,
+                    page = 1,
+                    hasNext = false,
+                )
+            }
+        }
+        return UnifiedHomeCatalog(mergedRows, alternatives)
     }
-    return UnifiedHomeCatalog(mergedRows, alternatives)
 }
+
+/** Batch helper retained for tests and callers that already have all rows. */
+internal fun mergeHomeRows(rows: List<HomeRow>): UnifiedHomeCatalog =
+    HomeCatalogAccumulator().apply { add(rows) }.snapshot()
