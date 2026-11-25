@@ -175,10 +175,11 @@ internal fun mergeHomeRows(rows: List<HomeRow>): UnifiedHomeCatalog {
     }
 
     val shelfEntries = shelves.entries.toList()
+    val allItems = rows.flatMap { it.items }
     val shelfIndexByUrl = linkedMapOf<String, Int>()
     shelfEntries.forEachIndexed { index, (_, matchingRows) ->
-        matchingRows.flatMap { it.items }.forEach { item ->
-            shelfIndexByUrl.putIfAbsent(item.url, index)
+        matchingRows.forEach { row ->
+            row.items.forEach { item -> shelfIndexByUrl.putIfAbsent(item.url, index) }
         }
     }
 
@@ -186,7 +187,7 @@ internal fun mergeHomeRows(rows: List<HomeRow>): UnifiedHomeCatalog {
     // reappear under a second provider's differently named Home category.
     val groupsByShelf = Array(shelfEntries.size) { mutableListOf<CatalogGroup>() }
     val alternatives = linkedMapOf<String, List<SearchResponse>>()
-    deduplicateCatalog(rows.flatMap { it.items }).forEach { group ->
+    deduplicateCatalog(allItems).forEach { group ->
         val owner = group.sources.mapNotNull { shelfIndexByUrl[it.url] }.minOrNull() ?: 0
         groupsByShelf[owner] += group
         group.sources.forEach { source -> alternatives[source.url] = group.sources }
