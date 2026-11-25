@@ -82,11 +82,13 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.plugins.PluginManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -94,10 +96,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicInteger
 
 @Immutable
 data class HomeRow(
@@ -110,11 +111,15 @@ data class HomeRow(
     /** The last page loaded into [items]. */
     val page: Int,
     val hasNext: Boolean,
+    /** All eligible source requests that can advance this unified category. */
+    val pagingSources: List<HomePageCursor> = emptyList(),
+    /** Non-null only when this row is a taxonomy-backed unified category. */
+    val catalogCategoryId: String? = null,
 )
 
 private data class HomeCatalogBatch(
-    val rows: List<HomeRow> = emptyList(),
-    val failure: String? = null,
+    val source: HomePageSource,
+    val result: Result<Engine.MainPageResult>,
 )
 
 class HomeViewModel(application: Application) : AndroidViewModel(application) {
@@ -156,6 +161,17 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private var loadJob: Job? = null
+    private var unifiedSession: Job? = null
+    private var loadGeneration: Long = 0L
+
+    private fun cancelActiveLoad() {
+        loadGeneration += 1L
+        unifiedSession?.cancel()
+        unifiedSession = null
+        loadJob?.cancel()
+        loadJob = null
+        _loading.value = false
+    }
 
     init {
         viewModelScope.launch {
@@ -173,17 +189,23 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun setSource(name: String?) {
         if (name == _selected.value) return
+        cancelActiveLoad()
         _selected.value = name
         if (name == null) {
-            loadJob?.cancel()
             _rows.value = emptyList()
             _loading.value = false
             _error.value = null
             _sourceOptions.value = emptyMap()
             return
         }
-        val api = Engine.provider(name) ?: return
-        if (!api.hasMainPage) return
+        val api = Engine.provider(name)
+        if (api == null || !api.hasMainPage) {
+            _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
+            _error.value = ""
+            _loading.value = false
+            return
+        }
         load(api)
     }
 
@@ -204,7 +226,8 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
 
     private fun loadAllSources() {
-        loadJob?.cancel()
+        cancelActiveLoad()
+        val generation = loadGeneration
         val apis = _providers.value.filter { it.hasMainPage }
         if (apis.isEmpty()) {
             _rows.value = emptyList()
@@ -220,187 +243,149 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             _rows.value = emptyList()
             _sourceOptions.value = emptyMap()
 
-            val accumulator = HomeCatalogAccumulator()
+            val sources = createHomePageSources(apis)
+            if (sources.isEmpty()) {
+                _loading.value = false
+                return@launch
+            }
+
+            val accumulator = UnifiedHomeCatalogAccumulator()
             var lastFailure: String? = null
+            var timedOut = false
+            val batches = Channel<HomeCatalogBatch>(Channel.UNLIMITED)
+            val supervisor = SupervisorJob(viewModelScope.coroutineContext[Job])
+            val workerScope = CoroutineScope(
+                viewModelScope.coroutineContext + supervisor + Dispatchers.IO,
+            )
+            unifiedSession = supervisor
+            val remaining = AtomicInteger(sources.size)
 
-            // Keep a small, fixed number of plugin calls in flight regardless
-            // of whether 8, 80, or 800 extensions are installed.
-            val globalGate = Semaphore(4)
-
-            // Stop waiting forever for a provider that never returns. Results
-            // already displayed remain available when this overall deadline ends.
-            val completed = withTimeoutOrNull(90_000L) {
-                coroutineScope {
-                    val batches = Channel<HomeCatalogBatch>(Channel.BUFFERED)
-                    val producers = apis.mapIndexed { providerIndex, api ->
-                        launch {
-                            try {
-                                val pages = api.mainPage
-                                val pageGate = Semaphore(if (api.sequentialMainPage) 1 else 2)
-
-                                coroutineScope {
-                                    pages.forEachIndexed { pageIndex, page ->
-                                        launch {
-                                            globalGate.withPermit {
-                                                pageGate.withPermit {
-                                                    try {
-                                                        val result = withTimeoutOrNull(18_000L) {
-                                                            Engine.mainPage(api, page)
-                                                        }
-
-                                                        if (result == null) {
-                                                            batches.send(
-                                                                HomeCatalogBatch(
-                                                                    failure = api.name + ": main page timed out",
-                                                                ),
-                                                            )
-                                                        } else {
-                                                            result.fold(
-                                                                onSuccess = { response ->
-                                                                    val pageRows = response.lists
-                                                                        .filter { it.list.isNotEmpty() }
-                                                                        .mapIndexed { rowIndex, list ->
-                                                                            HomeRow(
-                                                                                key = providerIndex.toString() + "-" +
-                                                                                    api.name + "-" + pageIndex + "-" +
-                                                                                    rowIndex + "-" + list.name,
-                                                                                title = list.name.ifBlank { page.name },
-                                                                                items = list.list,
-                                                                                horizontal = list.isHorizontalImages,
-                                                                                pageIndex = pageIndex,
-                                                                                page = 1,
-                                                                                hasNext = response.hasNext,
-                                                                            )
-                                                                        }
-                                                                    if (pageRows.isNotEmpty()) {
-                                                                        batches.send(HomeCatalogBatch(rows = pageRows))
-                                                                    }
-                                                                },
-                                                                onFailure = { failure ->
-                                                                    batches.send(
-                                                                        HomeCatalogBatch(
-                                                                            failure = api.name + ": " + failure.readableMessage(),
-                                                                        ),
-                                                                    )
-                                                                },
-                                                            )
-                                                        }
-                                                    } catch (cancelled: CancellationException) {
-                                                        throw cancelled
-                                                    } catch (failure: Exception) {
-                                                        batches.send(
-                                                            HomeCatalogBatch(
-                                                                failure = api.name + ": " +
-                                                                    (failure.message ?: failure::class.java.simpleName),
-                                                            ),
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } catch (cancelled: CancellationException) {
-                                throw cancelled
-                            } catch (failure: Exception) {
-                                // A broken extension is isolated from all other providers.
-                                batches.send(
-                                    HomeCatalogBatch(
-                                        failure = api.name + ": " +
-                                            (failure.message ?: failure::class.java.simpleName),
-                                    ),
-                                )
-                            }
-                        }
-                    }
-
-                    launch {
-                        producers.joinAll()
-                        batches.close()
-                    }
-
-                    // Consume results as soon as any provider/page responds.
-                    // Several queued results are merged together into one UI update.
-                    var nextBatch = batches.receiveCatching().getOrNull()
-                    while (nextBatch != null) {
-                        val incomingRows = mutableListOf<HomeRow>()
-                        var current: HomeCatalogBatch? = nextBatch
-                        while (current != null) {
-                            current.failure?.let { lastFailure = it }
-                            incomingRows += current.rows
-                            current = batches.tryReceive().getOrNull()
-                        }
-
-                        if (incomingRows.isNotEmpty()) {
-                            val snapshot = withContext(Dispatchers.Default) {
-                                accumulator.add(incomingRows)
-                                accumulator.snapshot()
-                            }
-                            _rows.value = snapshot.rows
-                            _sourceOptions.value = snapshot.sourcesByUrl
-                        }
-
-                        nextBatch = batches.receiveCatching().getOrNull()
+            // All requests are scheduled immediately, but HomePageSource applies
+            // a global eight-request limit and each provider's own concurrency gate.
+            // Workers are not joined: a non-cooperative extension must never hold
+            // the Home UI open after the session deadline.
+            sources.forEach { source ->
+                workerScope.launch {
+                    try {
+                        val result = withTimeoutOrNull(18_000L) {
+                            source.loadPage(1)
+                        } ?: Result.failure(IllegalStateException("Main page timed out"))
+                        batches.trySend(HomeCatalogBatch(source, result))
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Throwable) {
+                        batches.trySend(HomeCatalogBatch(source, Result.failure(failure)))
+                    } finally {
+                        if (remaining.decrementAndGet() == 0) batches.close()
                     }
                 }
-                true
-            } ?: false
+            }
 
-            _loading.value = false
-            if (_rows.value.isEmpty()) {
-                _error.value = lastFailure ?: if (!completed) {
-                    getApplication<Application>().getString(R.string.home_all_sources_timeout)
-                } else {
-                    ""
+            val timeoutWatch = launch {
+                delay(90_000L)
+                if (generation == loadGeneration) {
+                    timedOut = true
+                    supervisor.cancel()
+                    batches.close()
+                }
+            }
+
+            try {
+                for (batch in batches) {
+                    if (generation != loadGeneration) break
+                    val response = batch.result.getOrNull()
+                    if (response == null) {
+                        lastFailure = batch.source.api.name + ": " +
+                            (batch.result.exceptionOrNull()?.readableMessage() ?: "Unknown error")
+                        continue
+                    }
+
+                    val snapshot = withContext(Dispatchers.Default) {
+                        accumulator.addPage(batch.source, response)
+                        accumulator.snapshot()
+                    }
+                    if (generation == loadGeneration) {
+                        _rows.value = snapshot.rows
+                        _sourceOptions.value = snapshot.sourcesByUrl
+                    }
+                }
+            } finally {
+                timeoutWatch.cancel()
+                supervisor.cancel()
+                batches.close()
+            }
+
+            if (generation == loadGeneration) {
+                unifiedSession = null
+                _loading.value = false
+                if (_rows.value.isEmpty()) {
+                    _error.value = lastFailure ?: if (timedOut) {
+                        getApplication<Application>().getString(R.string.home_all_sources_timeout)
+                    } else {
+                        ""
+                    }
                 }
             }
         }
     }
 
     private fun load(api: MainAPI) {
-        loadJob?.cancel()
+        cancelActiveLoad()
+        val generation = loadGeneration
         loadJob = viewModelScope.launch {
             _loading.value = true
             _error.value = null
             _rows.value = emptyList()
             _sourceOptions.value = emptyMap()
 
-            val pages = api.mainPage
+            val pages = createHomePageSources(listOf(api))
             val results = arrayOfNulls<List<HomeRow>>(pages.size)
             var lastFailure: String? = null
-            val gate = Semaphore(if (api.sequentialMainPage) 1 else 3)
 
             coroutineScope {
-                pages.forEachIndexed { index, page ->
+                pages.forEachIndexed { index, source ->
                     launch {
-                        gate.withPermit {
-                            val result = Engine.mainPage(api, page)
-                            result.onSuccess { response ->
+                        val result = withTimeoutOrNull(18_000L) {
+                            source.loadPage(1)
+                        } ?: Result.failure(IllegalStateException("Main page timed out"))
+                        result.onSuccess { response ->
+                            if (generation == loadGeneration) {
                                 results[index] = response.lists
-                                    .filter { it.list.isNotEmpty() }
-                                    .mapIndexed { i, list ->
-                                        HomeRow(
-                                            key = "$index-$i-${list.name}",
-                                            title = list.name.ifBlank { page.name },
-                                            items = list.list,
-                                            horizontal = list.isHorizontalImages,
-                                            pageIndex = index,
-                                            page = 1,
-                                            hasNext = response.hasNext,
-                                        )
+                                .filter { it.list.isNotEmpty() }
+                                .mapIndexed { rowIndex, list ->
+                                    val cursors = if (response.hasNext) {
+                                        listOf(HomePageCursor(source, nextPage = 2, hasNext = true))
+                                    } else {
+                                        emptyList()
                                     }
+                                    HomeRow(
+                                        key = "$index-$rowIndex-${list.name}",
+                                        title = list.name.ifBlank { source.pageData.name },
+                                        items = list.list,
+                                        horizontal = list.isHorizontalImages,
+                                        pageIndex = index,
+                                        page = 1,
+                                        hasNext = response.hasNext,
+                                        pagingSources = cursors,
+                                    )
+                                }
                                 _rows.value = results.filterNotNull().flatten()
-                                _sourceOptions.value = _rows.value.flatMap { it.items }.associate { it.url to listOf(it) }
+                                _sourceOptions.value = _rows.value.flatMap { it.items }
+                                    .associate { it.url to listOf(it) }
                             }
-                            result.onFailure { lastFailure = it.readableMessage() }
+                        }
+                        result.onFailure {
+                            if (generation == loadGeneration) lastFailure = it.readableMessage()
                         }
                     }
                 }
             }
 
-            _loading.value = false
-            if (_rows.value.isEmpty()) {
-                _error.value = lastFailure ?: ""
+            if (generation == loadGeneration) {
+                _loading.value = false
+                if (_rows.value.isEmpty()) {
+                    _error.value = lastFailure ?: ""
+                }
             }
         }
     }
@@ -494,11 +479,8 @@ fun HomeScreen(
                     onRetry = viewModel::retry,
                     onPosterLongClick = { actionsItem = it },
                     onViewMore = { row ->
-                        val provider = selected
-                        if (provider != null) {
-                            expandedViewModel.open(provider, row)
-                            onOpenSection()
-                        }
+                        expandedViewModel.open(selected.orEmpty(), row)
+                        onOpenSection()
                     },
                 )
             }
@@ -679,11 +661,30 @@ private fun HomeShelves(
                 key = { _, row -> row.key },
                 contentType = { _, _ -> "shelf" },
             ) { index, row ->
-                // The expanded screen turns hasNext off when a page ends or fails,
-                // and that hides the button here without reloading Home.
-                val canViewMore = row.hasNext &&
-                    sections[sectionKey(selectedSource.orEmpty(), row.key)]?.hasNext != false
-                val viewMore: (() -> Unit)? = if (canViewMore) ({ onViewMore(row) }) else null
+                val displayTitle = when (row.catalogCategoryId) {
+                    HomeCategoryIds.MOVIES -> stringResource(R.string.home_catalog_movies)
+                    HomeCategoryIds.INDIAN_MOVIES -> stringResource(R.string.home_catalog_indian_movies)
+                    HomeCategoryIds.ASIAN_MOVIES -> stringResource(R.string.home_catalog_asian_movies)
+                    HomeCategoryIds.FOREIGN_MOVIES -> stringResource(R.string.home_catalog_foreign_movies)
+                    HomeCategoryIds.ARABIC_MOVIES -> stringResource(R.string.home_catalog_arabic_movies)
+                    HomeCategoryIds.TURKISH_MOVIES -> stringResource(R.string.home_catalog_turkish_movies)
+                    HomeCategoryIds.SERIES -> stringResource(R.string.home_catalog_series)
+                    HomeCategoryIds.ARABIC_SERIES -> stringResource(R.string.home_catalog_arabic_series)
+                    HomeCategoryIds.TURKISH_SERIES -> stringResource(R.string.home_catalog_turkish_series)
+                    HomeCategoryIds.INDIAN_SERIES -> stringResource(R.string.home_catalog_indian_series)
+                    HomeCategoryIds.ASIAN_SERIES -> stringResource(R.string.home_catalog_asian_series)
+                    HomeCategoryIds.FOREIGN_SERIES -> stringResource(R.string.home_catalog_foreign_series)
+                    HomeCategoryIds.ANIME -> stringResource(R.string.home_catalog_anime)
+                    HomeCategoryIds.ANIMATION -> stringResource(R.string.home_catalog_animation)
+                    HomeCategoryIds.DUBBED -> stringResource(R.string.home_catalog_dubbed)
+                    HomeCategoryIds.SUBTITLED -> stringResource(R.string.home_catalog_subtitled)
+                    else -> row.title
+                }
+                val displayRow = remember(row, displayTitle) { row.copy(title = displayTitle) }
+                // Each category has its own paging state, even when no provider is selected.
+                val canViewMore = displayRow.hasNext &&
+                    sections[sectionKey(selectedSource.orEmpty(), displayRow.key)]?.hasNext != false
+                val viewMore: (() -> Unit)? = if (canViewMore) ({ onViewMore(displayRow) }) else null
                 // The first three shelves rise in once; later ones just appear, and
                 // a provider switch reuses the already-settled rows.
                 if (index < 3) {
@@ -693,7 +694,7 @@ private fun HomeShelves(
                         enter = staggeredEnter(index),
                     ) {
                         Shelf(
-                            row = row,
+                            row = displayRow,
                             onOpenItem = onOpenItem,
                             onPosterLongClick = onPosterLongClick,
                             onViewMore = viewMore,
@@ -701,7 +702,7 @@ private fun HomeShelves(
                     }
                 } else {
                     Shelf(
-                        row = row,
+                        row = displayRow,
                         onOpenItem = onOpenItem,
                         onPosterLongClick = onPosterLongClick,
                         onViewMore = viewMore,

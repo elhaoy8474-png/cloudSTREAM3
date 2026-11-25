@@ -1,5 +1,7 @@
 package com.kodastream.app.ui.home
 
+import com.lagradost.cloudstream3.AnimeSearchResponse
+import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.MovieSearchResponse
 import com.lagradost.cloudstream3.TvSeriesSearchResponse
 import com.lagradost.cloudstream3.TvType
@@ -177,6 +179,62 @@ class HomeCatalogTest {
         assertEquals("Trending", updated.rows.first().title)
         assertEquals(listOf("Film One"), updated.rows.first().items.map { it.name })
         assertEquals(listOf("Film Two"), updated.rows.last().items.map { it.name })
+    }
+
+    @Test
+    fun indianMoviesAlsoBelongToTheGlobalMoviesCategory() {
+        val ids = homeCategoryIdsFor(movie("Pathaan", "Provider", "pathaan"), "hi", "Hindi catalogue")
+        assertTrue(ids.contains(HomeCategoryIds.MOVIES))
+        assertTrue(ids.contains(HomeCategoryIds.INDIAN_MOVIES))
+        assertFalse(ids.contains(HomeCategoryIds.FOREIGN_MOVIES))
+    }
+
+    @Test
+    fun regionalSeriesUseLanguageAndExplicitAsianDramaType() {
+        val arabic = TvSeriesSearchResponse(
+            "A", "a", "Arabic", TvType.TvSeries, year = 2024,
+        )
+        val turkish = TvSeriesSearchResponse(
+            "B", "b", "Provider", TvType.TvSeries, year = 2024,
+        )
+        val asian = TvSeriesSearchResponse(
+            "C", "c", "Provider", TvType.AsianDrama, year = 2024,
+        )
+
+        assertTrue(HomeCategoryIds.ARABIC_SERIES in homeCategoryIdsFor(arabic, "ar", ""))
+        assertTrue(HomeCategoryIds.TURKISH_SERIES in homeCategoryIdsFor(turkish, "tr", ""))
+        assertTrue(HomeCategoryIds.ASIAN_SERIES in homeCategoryIdsFor(asian, "en", ""))
+    }
+
+    @Test
+    fun animeCanBelongToDubbedAndSubtitledCrossCategoriesAtOnce() {
+        val item = AnimeSearchResponse(
+            name = "Example Anime",
+            url = "anime",
+            apiName = "Anime provider",
+            type = TvType.Anime,
+            dubStatus = mutableSetOf(DubStatus.Dubbed, DubStatus.Subbed),
+        )
+        val ids = homeCategoryIdsFor(item, "ja", "Japanese anime")
+        assertTrue(HomeCategoryIds.ANIME in ids)
+        assertTrue(HomeCategoryIds.DUBBED in ids)
+        assertTrue(HomeCategoryIds.SUBTITLED in ids)
+    }
+
+    @Test
+    fun arabicDubMarkersWorkEvenWhenTheItemIsNotAnAnimeResponse() {
+        val item = movie("فيلم مدبلج", "Source", "dubbed-film")
+        val ids = homeCategoryIdsFor(item, "en", "أفلام مترجمة ومدبلجة")
+        assertTrue(HomeCategoryIds.DUBBED in ids)
+        assertTrue(HomeCategoryIds.SUBTITLED in ids)
+    }
+
+    @Test
+    fun unknownProviderLanguageDoesNotInventAForeignCategory() {
+        val ids = homeCategoryIdsFor(movie("Unknown film", "Provider", "unknown"), "xx", "Unknown source")
+        assertTrue(HomeCategoryIds.MOVIES in ids)
+        assertFalse(HomeCategoryIds.FOREIGN_MOVIES in ids)
+        assertFalse(HomeCategoryIds.ARABIC_MOVIES in ids)
     }
 
 }

@@ -111,7 +111,7 @@ private fun titleSimilarity(left: String, right: String): Double {
     return tokenF1 * 0.55 + characterScore * 0.45
 }
 
-private fun sameWork(left: SearchResponse, right: SearchResponse): Boolean {
+internal fun sameWork(left: SearchResponse, right: SearchResponse): Boolean {
     if (mediaFamily(left) != mediaFamily(right)) return false
     val leftYear = releaseYear(left)
     val rightYear = releaseYear(right)
@@ -127,7 +127,7 @@ private fun sameWork(left: SearchResponse, right: SearchResponse): Boolean {
  * Conservative, deterministic clustering. Exact names are cheap; fuzzy matches
  * require a high score and compatible media type/year to avoid merging remakes.
  */
-private fun titleNgrams(value: String): Set<String> {
+internal fun titleNgrams(value: String): Set<String> {
     if (value.length < 3) return setOf(value)
     return (0..value.length - 3).mapTo(linkedSetOf()) { value.substring(it, it + 3) }
 }
