@@ -249,12 +249,16 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                         }
 
                         providerRows[providerIndex] = pageRows.filterNotNull().flatten()
-                        val unified = mergeHomeRows(providerRows.filterNotNull().flatten())
-                        _rows.value = unified.rows
-                        _sourceOptions.value = unified.sourcesByUrl
                     }
                 }
             }
+
+            // Merge once after every provider has completed. Rebuilding the full
+            // fuzzy-deduplicated catalogue after each provider multiplies CPU and
+            // allocation pressure on devices with many installed extensions.
+            val unified = mergeHomeRows(providerRows.filterNotNull().flatten())
+            _rows.value = unified.rows
+            _sourceOptions.value = unified.sourcesByUrl
 
             _loading.value = false
             if (_rows.value.isEmpty()) _error.value = lastFailure ?: ""
