@@ -24,6 +24,9 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Surface
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
@@ -119,6 +122,10 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
+    private val _sourceOptions = MutableStateFlow<Map<String, List<SearchResponse>>>(emptyMap())
+    fun sourcesFor(item: SearchResponse): List<SearchResponse> =
+        _sourceOptions.value[item.url].orEmpty().ifEmpty { listOf(item) }
+
     /**
      * The hero comes from the first shelf that has enough posters, preferring
      * a portrait row. Derived here so composition never walks the shelves,
@@ -141,7 +148,10 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     init {
         viewModelScope.launch {
             // Runs again every time an extension is installed, updated or removed.
-            PluginManager.revision.collect { _providers.value = Engine.homeProviders() }
+            PluginManager.revision.collect {
+                _providers.value = Engine.homeProviders()
+                if (_selected.value == null && PluginManager.startupDone.value) loadAllSources()
+            }
         }
     }
 
@@ -157,6 +167,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             _rows.value = emptyList()
             _loading.value = false
             _error.value = null
+            _sourceOptions.value = emptyMap()
             return
         }
         val api = Engine.provider(name) ?: return
@@ -164,9 +175,89 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         load(api)
     }
 
+    fun setAllSources() {
+        if (_selected.value == null && (_loading.value || _rows.value.isNotEmpty())) return
+        _selected.value = null
+        loadAllSources()
+    }
+
     fun retry() {
-        val api = Engine.provider(_selected.value) ?: return
-        load(api)
+        val selectedName = _selected.value
+        if (selectedName == null) {
+            loadAllSources()
+        } else {
+            Engine.provider(selectedName)?.let(::load)
+        }
+    }
+
+    private fun loadAllSources() {
+        loadJob?.cancel()
+        val apis = _providers.value.filter { it.hasMainPage }
+        if (apis.isEmpty()) {
+            _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
+            _loading.value = false
+            _error.value = null
+            return
+        }
+
+        loadJob = viewModelScope.launch {
+            _loading.value = true
+            _error.value = null
+            _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
+
+            val providerRows = arrayOfNulls<List<HomeRow>>(apis.size)
+            var lastFailure: String? = null
+            val globalGate = Semaphore(4)
+
+            coroutineScope {
+                apis.forEachIndexed { providerIndex, api ->
+                    launch {
+                        val pages = api.mainPage
+                        val pageRows = arrayOfNulls<List<HomeRow>>(pages.size)
+                        val pageGate = Semaphore(if (api.sequentialMainPage) 1 else 3)
+
+                        coroutineScope {
+                            pages.forEachIndexed { pageIndex, page ->
+                                launch {
+                                    globalGate.withPermit {
+                                        pageGate.withPermit {
+                                            Engine.mainPage(api, page).fold(
+                                                onSuccess = { response ->
+                                                    pageRows[pageIndex] = response.lists
+                                                        .filter { it.list.isNotEmpty() }
+                                                        .mapIndexed { rowIndex, list ->
+                                                            HomeRow(
+                                                                key = "\${api.name}-\${pageIndex}-\${rowIndex}-\${list.name}",
+                                                                title = list.name.ifBlank { page.name },
+                                                                items = list.list,
+                                                                horizontal = list.isHorizontalImages,
+                                                                pageIndex = pageIndex,
+                                                                page = 1,
+                                                                hasNext = response.hasNext,
+                                                            )
+                                                        }
+                                                },
+                                                onFailure = { lastFailure = it.readableMessage() },
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        providerRows[providerIndex] = pageRows.filterNotNull().flatten()
+                        val unified = mergeHomeRows(providerRows.filterNotNull().flatten())
+                        _rows.value = unified.rows
+                        _sourceOptions.value = unified.sourcesByUrl
+                    }
+                }
+            }
+
+            _loading.value = false
+            if (_rows.value.isEmpty()) _error.value = lastFailure ?: ""
+        }
     }
 
     private fun load(api: MainAPI) {
@@ -175,6 +266,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             _loading.value = true
             _error.value = null
             _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
 
             val pages = api.mainPage
             val results = arrayOfNulls<List<HomeRow>>(pages.size)
@@ -201,6 +293,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                                         )
                                     }
                                 _rows.value = results.filterNotNull().flatten()
+                                _sourceOptions.value = _rows.value.flatMap { it.items }.associate { it.url to listOf(it) }
                             }
                             result.onFailure { lastFailure = it.readableMessage() }
                         }
@@ -247,10 +340,19 @@ fun HomeScreen(
     val sections by expandedViewModel.sections.collectAsState()
     val startupDone by PluginManager.startupDone.collectAsState()
     val sourceName by sourceViewModel.home.collectAsState()
+    val allSources by sourceViewModel.homeAll.collectAsState()
     var actionsItem by remember { mutableStateOf<SearchResponse?>(null) }
+    var sourceChoices by remember { mutableStateOf<List<SearchResponse>?>(null) }
 
-    // One direction: the source owner resolves the name, Home only loads it.
-    LaunchedEffect(sourceName) { viewModel.setSource(sourceName) }
+    val openCatalogItem: (SearchResponse) -> Unit = { item ->
+        val candidates = viewModel.sourcesFor(item)
+        if (candidates.size > 1) sourceChoices = candidates else onOpenItem(item)
+    }
+
+    // New installs see one catalogue assembled from every installed home provider.
+    LaunchedEffect(allSources, sourceName) {
+        if (allSources) viewModel.setAllSources() else viewModel.setSource(sourceName)
+    }
     // A different provider invalidates every paged section and its page indexes.
     LaunchedEffect(selected) { expandedViewModel.setProvider(selected) }
 
@@ -268,7 +370,7 @@ fun HomeScreen(
 
             // The owner is still resolving the saved source; do not show a
             // different provider's shelves in the meantime.
-            selected == null -> LoadingBox(Modifier.padding(contentPadding))
+            selected == null && !allSources -> LoadingBox(Modifier.padding(contentPadding))
 
             else -> ExpressivePullToRefresh(
                 isRefreshing = loading,
@@ -280,6 +382,7 @@ fun HomeScreen(
             ) {
                 HomeShelves(
                     selectedSource = selected,
+                    sourceLabel = if (allSources) stringResource(R.string.search_scope_all) else selected,
                     rows = rows,
                     hero = hero,
                     continueWatchingItems = continueWatchingItems,
@@ -288,7 +391,7 @@ fun HomeScreen(
                     sections = sections,
                     contentPadding = contentPadding,
                     onOpenSources = onOpenSources,
-                    onOpenItem = onOpenItem,
+                    onOpenItem = openCatalogItem,
                     onOpenDetails = onOpenDetails,
                     onResume = onResume,
                     onRetry = viewModel::retry,
@@ -306,6 +409,16 @@ fun HomeScreen(
         actionsItem?.let { item ->
             PosterActionsSheet(item = item, onDismiss = { actionsItem = null })
         }
+        sourceChoices?.let { candidates ->
+            HomeSourceChooser(
+                candidates = candidates,
+                onSelect = { selectedItem ->
+                    sourceChoices = null
+                    onOpenItem(selectedItem)
+                },
+                onDismiss = { sourceChoices = null },
+            )
+        }
     }
 }
 
@@ -316,6 +429,7 @@ fun HomeScreen(
 @Composable
 private fun HomeShelves(
     selectedSource: String?,
+    sourceLabel: String?,
     rows: List<HomeRow>,
     hero: List<SearchResponse>,
     continueWatchingItems: List<HistoryEntry>,
@@ -397,12 +511,12 @@ private fun HomeShelves(
             }
 
             // The provider belongs to this page, not the app shell.
-            if (selectedSource != null) {
+            if (sourceLabel != null) {
                 item(key = "source") {
                     SourceChip(
-                        label = selectedSource,
+                        label = sourceLabel,
                         onClick = onOpenSources,
-                        leading = { SourceAvatar(name = selectedSource) },
+                        leading = { SourceAvatar(name = selectedSource.orEmpty()) },
                         modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 12.dp),
                     )
                 }
@@ -502,6 +616,60 @@ private fun HomeShelves(
                 item(key = "more") {
                     Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
                         LoadingIndicator(Modifier.size(32.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+private fun HomeSourceChooser(
+    candidates: List<SearchResponse>,
+    onSelect: (SearchResponse) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.home_choose_source_title),
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            Text(
+                text = stringResource(R.string.home_choose_source_description),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                items(candidates, key = { "\${it.apiName}|\${it.url}" }) { candidate ->
+                    Surface(
+                        onClick = { onSelect(candidate) },
+                        shape = MaterialTheme.shapes.medium,
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            SourceAvatar(name = candidate.apiName)
+                            Column(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
+                                Text(candidate.apiName, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    candidate.name,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
                     }
                 }
             }
