@@ -35,6 +35,20 @@ data class ExpandedSection(
     val requestId: Long = 0L,
 )
 
+/**
+ * Pagination progress is measured against this source's returned URLs, not
+ * the merged card count. A different source may add a new card in the same
+ * batch; that must not keep this source alive when it repeats old pages.
+ */
+internal fun hasNewSourceItems(
+    current: List<SearchResponse>,
+    incoming: List<SearchResponse>,
+): Boolean {
+    if (incoming.isEmpty()) return false
+    val currentUrls = current.asSequence().map { it.url }.toHashSet()
+    return incoming.any { it.url !in currentUrls }
+}
+
 private fun mergePagedItems(
     current: List<SearchResponse>,
     incoming: List<SearchResponse>,
@@ -240,21 +254,21 @@ class ExpandedHomeViewModel : ViewModel() {
                         latest
                     } else {
                         val incoming = response?.let { pageItemsForSection(latest, cursor, it) }.orEmpty()
+                        val sourcePageHadNewItems = hasNewSourceItems(latest.items, incoming)
                         val mergedItems = mergePagedItems(latest.items, incoming)
-                        val pageHadNewItems = mergedItems.size > latest.items.size
                         val updatedCursors = latest.sourceCursors.map { existing ->
                             if (existing.source.id != cursor.source.id) {
                                 existing
                             } else if (response == null) {
                                 existing.copy(failed = true)
                             } else {
-                                val emptyPages = if (pageHadNewItems) 0 else existing.emptyPageCount + 1
+                                val emptyPages = if (sourcePageHadNewItems) 0 else existing.emptyPageCount + 1
                                 existing.copy(
                                     nextPage = cursor.nextPage + 1,
                                     hasNext = response.hasNext && if (latest.catalogCategoryId != null) {
                                         emptyPages < 3
                                     } else {
-                                        pageHadNewItems
+                                        sourcePageHadNewItems
                                     },
                                     failed = false,
                                     emptyPageCount = emptyPages,

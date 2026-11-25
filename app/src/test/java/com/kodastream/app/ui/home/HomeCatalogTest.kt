@@ -242,7 +242,18 @@ class HomeCatalogTest {
     }
 
     @Test
-    fun firstVisibleDuplicateKeepsItsCardAndOrderWhenEarlierProviderRepliesLater() {
+    fun sourcePaginationProgressIsIndependentOfOtherSources() {
+        val existing = listOf(movie("Film One", "Source A", "source-a"))
+        val repeatedPage = listOf(movie("Film One", "Source A", "source-a"))
+        val newProviderCopy = listOf(movie("Film One", "Source B", "source-b"))
+
+        assertFalse(hasNewSourceItems(existing, repeatedPage))
+        assertTrue(hasNewSourceItems(existing, newProviderCopy))
+        assertFalse(hasNewSourceItems(existing, emptyList()))
+    }
+
+    @Test
+    fun catalogueOrderUsesProviderPriorityWhenResponsesArriveOutOfOrder() {
         fun provider(name: String) = object : MainAPI() {
             init {
                 this.name = name
@@ -274,9 +285,9 @@ class HomeCatalogTest {
             ),
         )
         val updated = accumulator.snapshot()
-        assertEquals("Second", updated.rows.first().items.first().apiName)
+        assertEquals("First", updated.rows.first().items.first().apiName)
         assertEquals(
-            listOf("Second", "First"),
+            listOf("First", "Second"),
             updated.sourcesByUrl.getValue("second").map { it.apiName },
         )
     }
