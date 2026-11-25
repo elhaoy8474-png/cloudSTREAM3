@@ -229,7 +229,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                                                         .filter { it.list.isNotEmpty() }
                                                         .mapIndexed { rowIndex, list ->
                                                             HomeRow(
-                                                                key = "\${api.name}-\${pageIndex}-\${rowIndex}-\${list.name}",
+                                                                key = "${api.name}-${pageIndex}-${rowIndex}-${list.name}",
                                                                 title = list.name.ifBlank { page.name },
                                                                 items = list.list,
                                                                 horizontal = list.isHorizontalImages,
@@ -648,7 +648,7 @@ private fun HomeSourceChooser(
                 modifier = Modifier.padding(horizontal = 20.dp),
             )
             LazyColumn(modifier = Modifier.fillMaxWidth()) {
-                items(candidates, key = { "\${it.apiName}|\${it.url}" }) { candidate ->
+                items(candidates, key = { "${it.apiName}|${it.url}" }) { candidate ->
                     Surface(
                         onClick = { onSelect(candidate) },
                         shape = MaterialTheme.shapes.medium,
