@@ -108,6 +108,22 @@ class HomeCatalogTest {
     }
 
     @Test
+    fun catalogueHandlesManyProvidersWithoutLosingDistinctItems() {
+        val rows = (0 until 100).map { provider ->
+            val items = (0 until 12).map { item ->
+                val value = (provider * 7919 + item * 104729) xor 0x5A5A5A5A
+                movie("q${Integer.toHexString(value)}", "Provider $provider", "$provider-$item", null)
+            }
+            HomeRow("provider-$provider", "Shelf $provider", items, false, 0, 1, false)
+        }
+
+        val unified = mergeHomeRows(rows)
+
+        assertEquals(1200, unified.rows.sumOf { it.items.size })
+        assertEquals(1200, unified.sourcesByUrl.size)
+    }
+
+    @Test
     fun unifiedShelvesKeepOneCardAndExposeEveryProviderUrl() {
         val unified = mergeHomeRows(
             listOf(
