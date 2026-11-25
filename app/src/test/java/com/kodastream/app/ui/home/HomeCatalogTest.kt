@@ -77,6 +77,24 @@ class HomeCatalogTest {
     }
 
     @Test
+    fun onlyTrailingYearsAreRemovedFromTitles() {
+        assertEquals("1917", normalizeCatalogTitle("1917"))
+        assertEquals("2020 a new beginning", normalizeCatalogTitle("2020: A New Beginning"))
+        assertEquals("film name", normalizeCatalogTitle("Film Name (2020)"))
+    }
+
+    @Test
+    fun trailingYearSuffixKeepsRemakesSeparateWithoutProviderYearFields() {
+        val groups = deduplicateCatalog(
+            listOf(
+                movie("Film Name (2010)", "Source A", "a", null),
+                movie("Film Name (2022)", "Source B", "b", null),
+            ),
+        )
+        assertEquals(2, groups.size)
+    }
+
+    @Test
     fun unrelatedTitlesAreNotMergedByLooseSubstringMatching() {
         val groups = deduplicateCatalog(
             listOf(
