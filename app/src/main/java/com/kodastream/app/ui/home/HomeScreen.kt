@@ -348,7 +348,11 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
             _loading.value = false
             if (_rows.value.isEmpty()) {
-                _error.value = lastFailure ?: if (!completed) "" else ""
+                _error.value = lastFailure ?: if (!completed) {
+                    getApplication<Application>().getString(R.string.home_all_sources_timeout)
+                } else {
+                    ""
+                }
             }
         }
     }
