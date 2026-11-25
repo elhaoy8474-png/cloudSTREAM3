@@ -1,0 +1,56 @@
+name: Unified Home verification
+
+on:
+  push:
+    branches:
+      - feature/unified-home-catalog
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unified-home-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Build, test and lint
+        run: ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :library:jvmTest --stacktrace
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud3-unified-home-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload test and lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud3-unified-home-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/reports/lint-results-debug.html
+            library/build/reports/tests/
+          if-no-files-found: ignore
