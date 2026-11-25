@@ -1,0 +1,138 @@
+package com.kodastream.app.ui.home
+
+import com.lagradost.cloudstream3.AnimeSearchResponse
+import com.lagradost.cloudstream3.MovieSearchResponse
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.TvSeriesSearchResponse
+import com.lagradost.cloudstream3.TvType
+import java.text.Normalizer
+import java.util.Locale
+
+/** A title cluster keeps every playable provider result; the first result is its display card. */
+internal data class CatalogGroup(
+    val primary: SearchResponse,
+    val sources: List<SearchResponse>,
+)
+
+/** Rows and source alternatives produced by combining the installed providers' first home pages. */
+internal data class UnifiedHomeCatalog(
+    val rows: List<HomeRow>,
+    /** Every source URL points to the full set of provider alternatives for that work. */
+    val sourcesByUrl: Map<String, List<SearchResponse>>,
+)
+
+internal fun normalizeCatalogTitle(value: String): String {
+    val normalized = Normalizer.normalize(value, Normalizer.Form.NFKD)
+        .lowercase(Locale.ROOT)
+        .replace(Regex("\\p{M}+"), "")
+        .replace(Regex("[\\u064B-\\u065F\\u0670\\u0640]"), "")
+        .replace(Regex("\\b(19|20)\\d{2}\\b"), " ")
+        .replace(Regex("\\b(2160p|1440p|1080p|720p|480p|4k|8k|hdrip|webrip|web-dl|bluray|brrip|hdtv)\\b"), " ")
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .trim()
+        .replace(Regex("\\s+"), " ")
+    return normalized.split(' ')
+        .filterNot { it.isBlank() || it == "the" || it == "a" || it == "an" }
+        .joinToString(" ")
+}
+
+private fun mediaFamily(item: SearchResponse): String = when (item.type) {
+    TvType.Movie, TvType.AnimeMovie -> "movie"
+    TvType.TvSeries, TvType.Anime, TvType.OVA, TvType.Cartoon, TvType.AsianDrama -> "series"
+    TvType.Live -> "live"
+    TvType.Torrent -> "torrent"
+    TvType.Documentary -> "documentary"
+    TvType.NSFW -> "nsfw"
+    TvType.Music, TvType.AudioBook, TvType.Audio, TvType.Podcast -> "audio"
+    TvType.CustomMedia, TvType.Video -> "video"
+    TvType.Others, null -> "other"
+}
+
+private fun releaseYear(item: SearchResponse): Int? = when (item) {
+    is MovieSearchResponse -> item.year
+    is TvSeriesSearchResponse -> item.year
+    is AnimeSearchResponse -> item.year
+    else -> Regex("\\b(19|20)\\d{2}\\b").find(item.name)?.value?.toIntOrNull()
+}
+
+private fun titleSimilarity(left: String, right: String): Double {
+    if (left == right) return 1.0
+    if (left.isBlank() || right.isBlank()) return 0.0
+
+    val leftTokens = left.split(' ').toSet()
+    val rightTokens = right.split(' ').toSet()
+    val tokenUnion = leftTokens union rightTokens
+    val tokenScore = if (tokenUnion.isEmpty()) 0.0 else {
+        (leftTokens intersect rightTokens).size.toDouble() / tokenUnion.size
+    }
+
+    fun bigrams(value: String): Set<String> =
+        if (value.length < 2) setOf(value) else (0 until value.length - 1).map { value.substring(it, it + 2) }.toSet()
+
+    val leftPairs = bigrams(left)
+    val rightPairs = bigrams(right)
+    val pairCount = leftPairs.size + rightPairs.size
+    val pairScore = if (pairCount == 0) 0.0 else {
+        2.0 * (leftPairs intersect rightPairs).size / pairCount
+    }
+    return tokenScore * 0.55 + pairScore * 0.45
+}
+
+private fun sameWork(left: SearchResponse, right: SearchResponse): Boolean {
+    if (mediaFamily(left) != mediaFamily(right)) return false
+    val leftYear = releaseYear(left)
+    val rightYear = releaseYear(right)
+    if (leftYear != null && rightYear != null && leftYear != rightYear) return false
+
+    val leftTitle = normalizeCatalogTitle(left.name)
+    val rightTitle = normalizeCatalogTitle(right.name)
+    val threshold = if (leftYear != null && rightYear != null) 0.88 else 0.94
+    return titleSimilarity(leftTitle, rightTitle) >= threshold
+}
+
+/**
+ * Conservative, deterministic clustering. Exact names are cheap; fuzzy matches
+ * require a high score and compatible media type/year to avoid merging remakes.
+ */
+internal fun deduplicateCatalog(items: List<SearchResponse>): List<CatalogGroup> {
+    val groups = mutableListOf<MutableList<SearchResponse>>()
+    items.filter { it.url.isNotBlank() }.forEach { item ->
+        val existing = groups.firstOrNull { group -> sameWork(group.first(), item) }
+        if (existing == null) {
+            groups += mutableListOf(item)
+        } else if (existing.none { it.apiName == item.apiName && it.url == item.url }) {
+            existing += item
+        }
+    }
+    return groups.map { group -> CatalogGroup(group.first(), group.toList()) }
+}
+
+/**
+ * Combine similarly named shelves from all extensions, then expose each work
+ * once in that shelf while retaining every provider URL for the source chooser.
+ */
+internal fun mergeHomeRows(rows: List<HomeRow>): UnifiedHomeCatalog {
+    val shelves = linkedMapOf<Pair<String, Boolean>, MutableList<HomeRow>>()
+    rows.forEach { row ->
+        val key = normalizeCatalogTitle(row.title).ifBlank { row.title.lowercase(Locale.ROOT) } to row.horizontal
+        shelves.getOrPut(key) { mutableListOf() }.add(row)
+    }
+
+    val alternatives = linkedMapOf<String, List<SearchResponse>>()
+    val mergedRows = shelves.entries.mapIndexed { index, (key, matchingRows) ->
+        val groups = deduplicateCatalog(matchingRows.flatMap { it.items })
+        groups.forEach { group ->
+            group.sources.forEach { source -> alternatives[source.url] = group.sources }
+        }
+        HomeRow(
+            key = "unified-$index-${key.first}-${key.second}",
+            title = matchingRows.first().title,
+            items = groups.map { it.primary },
+            horizontal = key.second,
+            pageIndex = -1,
+            page = 1,
+            hasNext = false,
+        )
+    }
+    return UnifiedHomeCatalog(mergedRows, alternatives)
+}
