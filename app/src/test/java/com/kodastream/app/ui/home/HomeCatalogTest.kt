@@ -138,4 +138,43 @@ class HomeCatalogTest {
         assertFalse(unified.rows.single().hasNext)
         assertTrue(unified.rows.single().key.startsWith("unified-"))
     }
+    @Test
+    fun incrementalUpdatesPublishEarlyRowsAndMergeLaterDuplicatesInPlace() {
+        val accumulator = HomeCatalogAccumulator()
+        accumulator.add(
+            listOf(
+                HomeRow("a", "Trending", listOf(movie("Film One", "Source A", "a")), false, 0, 1, false),
+            ),
+        )
+
+        val early = accumulator.snapshot()
+        assertEquals(listOf("Film One"), early.rows.single().items.map { it.name })
+        assertEquals(listOf("Source A"), early.sourcesByUrl.getValue("a").map { it.apiName })
+
+        accumulator.add(
+            listOf(
+                HomeRow(
+                    "b",
+                    "New Releases",
+                    listOf(
+                        movie("Film One (2020)", "Source B", "b"),
+                        movie("Film Two", "Source B", "c"),
+                    ),
+                    false,
+                    0,
+                    1,
+                    false,
+                ),
+            ),
+        )
+
+        val updated = accumulator.snapshot()
+        assertEquals(2, updated.rows.sumOf { it.items.size })
+        assertEquals(2, updated.sourcesByUrl.getValue("a").size)
+        assertEquals(2, updated.sourcesByUrl.getValue("b").size)
+        assertEquals("Trending", updated.rows.first().title)
+        assertEquals(listOf("Film One"), updated.rows.first().items.map { it.name })
+        assertEquals(listOf("Film Two"), updated.rows.last().items.map { it.name })
+    }
+
 }
