@@ -27,7 +27,7 @@ internal fun normalizeCatalogTitle(value: String): String {
         .replace(Regex("\\p{M}+"), "")
         .replace(Regex("[\\u064B-\\u065F\\u0670\\u0640]"), "")
         .replace(Regex("\\b(2160p|1440p|1080p|720p|480p|4k|8k|hdrip|webrip|web-dl|bluray|brrip|hdtv)\\b"), " ")
-        .replace(Regex("""(?:\\s|\\(|\\[)+(?:19|20)\\d{2}[\\)\\]]*\\s*$"""), " ")
+        .replace(Regex("""(?:\s|\(|\[)+(?:19|20)\d{2}[\)\]]*\s*$"""), " ")
         .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
         .trim()
         .replace(Regex("\\s+"), " ")
@@ -55,7 +55,7 @@ private fun releaseYear(item: SearchResponse): Int? {
         is AnimeSearchResponse -> item.year
         else -> null
     }
-    val trailingYear = Regex("""(?:\\s|\\(|\\[)+((?:19|20)\\d{2})[\\)\\]]*\\s*$""")
+    val trailingYear = Regex("""(?:\s|\(|\[)+((?:19|20)\d{2})[\)\]]*\s*$""")
         .find(item.name)
         ?.groupValues
         ?.getOrNull(1)
