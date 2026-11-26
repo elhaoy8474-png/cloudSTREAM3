@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row as ComposeRow
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -24,6 +25,9 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Surface
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
@@ -77,8 +81,14 @@ import com.kodastream.app.ui.theme.ArtworkStatusBarIcons
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.plugins.PluginManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -86,8 +96,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicInteger
 
 @Immutable
 data class HomeRow(
@@ -100,6 +110,15 @@ data class HomeRow(
     /** The last page loaded into [items]. */
     val page: Int,
     val hasNext: Boolean,
+    /** All eligible source requests that can advance this unified category. */
+    val pagingSources: List<HomePageCursor> = emptyList(),
+    /** Non-null only when this row is a taxonomy-backed unified category. */
+    val catalogCategoryId: String? = null,
+)
+
+private data class HomeCatalogBatch(
+    val source: HomePageSource,
+    val result: Result<Engine.MainPageResult>,
 )
 
 class HomeViewModel(application: Application) : AndroidViewModel(application) {
@@ -119,6 +138,10 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
+    private val _sourceOptions = MutableStateFlow<Map<String, List<SearchResponse>>>(emptyMap())
+    fun sourcesFor(item: SearchResponse): List<SearchResponse> =
+        _sourceOptions.value[item.url].orEmpty().ifEmpty { listOf(item) }
+
     /**
      * The hero comes from the first shelf that has enough posters, preferring
      * a portrait row. Derived here so composition never walks the shelves,
@@ -137,11 +160,25 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private var loadJob: Job? = null
+    private var unifiedSession: Job? = null
+    private var loadGeneration: Long = 0L
+
+    private fun cancelActiveLoad() {
+        loadGeneration += 1L
+        unifiedSession?.cancel()
+        unifiedSession = null
+        loadJob?.cancel()
+        loadJob = null
+        _loading.value = false
+    }
 
     init {
         viewModelScope.launch {
             // Runs again every time an extension is installed, updated or removed.
-            PluginManager.revision.collect { _providers.value = Engine.homeProviders() }
+            PluginManager.revision.collect {
+                _providers.value = Engine.homeProviders()
+                if (_selected.value == null && PluginManager.startupDone.value) loadAllSources()
+            }
         }
     }
 
@@ -151,66 +188,199 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun setSource(name: String?) {
         if (name == _selected.value) return
+        cancelActiveLoad()
         _selected.value = name
         if (name == null) {
-            loadJob?.cancel()
             _rows.value = emptyList()
+            _loading.value = false
+            _error.value = null
+            _sourceOptions.value = emptyMap()
+            return
+        }
+        val api = Engine.provider(name)
+        if (api == null || !api.hasMainPage) {
+            _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
+            _error.value = ""
+            _loading.value = false
+            return
+        }
+        load(api)
+    }
+
+    fun setAllSources() {
+        if (_selected.value == null && (_loading.value || _rows.value.isNotEmpty())) return
+        _selected.value = null
+        loadAllSources()
+    }
+
+    fun retry() {
+        val selectedName = _selected.value
+        if (selectedName == null) {
+            loadAllSources()
+        } else {
+            Engine.provider(selectedName)?.let(::load)
+        }
+    }
+
+
+    private fun loadAllSources() {
+        cancelActiveLoad()
+        val generation = loadGeneration
+        val apis = _providers.value.filter { it.hasMainPage }
+        if (apis.isEmpty()) {
+            _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
             _loading.value = false
             _error.value = null
             return
         }
-        val api = Engine.provider(name) ?: return
-        if (!api.hasMainPage) return
-        load(api)
-    }
 
-    fun retry() {
-        val api = Engine.provider(_selected.value) ?: return
-        load(api)
-    }
-
-    private fun load(api: MainAPI) {
-        loadJob?.cancel()
         loadJob = viewModelScope.launch {
             _loading.value = true
             _error.value = null
             _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
 
-            val pages = api.mainPage
+            val sources = createHomePageSources(apis)
+            if (sources.isEmpty()) {
+                _loading.value = false
+                return@launch
+            }
+
+            val accumulator = UnifiedHomeCatalogAccumulator()
+            var lastFailure: String? = null
+            var timedOut = false
+            val batches = Channel<HomeCatalogBatch>(Channel.UNLIMITED)
+            val supervisor = SupervisorJob(viewModelScope.coroutineContext[Job])
+            val workerScope = CoroutineScope(
+                viewModelScope.coroutineContext + supervisor + Dispatchers.IO,
+            )
+            unifiedSession = supervisor
+            val remaining = AtomicInteger(sources.size)
+
+            // All requests are scheduled immediately, but HomePageSource applies
+            // a global eight-request limit and each provider's own concurrency gate.
+            // Workers are not joined: a non-cooperative extension must never hold
+            // the Home UI open after the session deadline.
+            sources.forEach { source ->
+                workerScope.launch {
+                    try {
+                        val result = source.loadPage(1)
+                        batches.trySend(HomeCatalogBatch(source, result))
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Throwable) {
+                        batches.trySend(HomeCatalogBatch(source, Result.failure(failure)))
+                    } finally {
+                        if (remaining.decrementAndGet() == 0) batches.close()
+                    }
+                }
+            }
+
+            val timeoutWatch = launch {
+                delay(90_000L)
+                if (generation == loadGeneration) {
+                    timedOut = true
+                    supervisor.cancel()
+                    batches.close()
+                }
+            }
+
+            try {
+                for (batch in batches) {
+                    if (generation != loadGeneration) break
+                    val response = batch.result.getOrNull()
+                    if (response == null) {
+                        lastFailure = batch.source.api.name + ": " +
+                            (batch.result.exceptionOrNull()?.readableMessage() ?: "Unknown error")
+                        continue
+                    }
+
+                    val snapshot = withContext(Dispatchers.Default) {
+                        accumulator.addPage(batch.source, response)
+                        accumulator.snapshot()
+                    }
+                    if (generation == loadGeneration) {
+                        _rows.value = snapshot.rows
+                        _sourceOptions.value = snapshot.sourcesByUrl
+                    }
+                }
+            } finally {
+                timeoutWatch.cancel()
+                supervisor.cancel()
+                batches.close()
+            }
+
+            if (generation == loadGeneration) {
+                unifiedSession = null
+                _loading.value = false
+                if (_rows.value.isEmpty()) {
+                    _error.value = lastFailure ?: if (timedOut) {
+                        getApplication<Application>().getString(R.string.home_all_sources_timeout)
+                    } else {
+                        ""
+                    }
+                }
+            }
+        }
+    }
+
+    private fun load(api: MainAPI) {
+        cancelActiveLoad()
+        val generation = loadGeneration
+        loadJob = viewModelScope.launch {
+            _loading.value = true
+            _error.value = null
+            _rows.value = emptyList()
+            _sourceOptions.value = emptyMap()
+
+            val pages = createHomePageSources(listOf(api))
             val results = arrayOfNulls<List<HomeRow>>(pages.size)
             var lastFailure: String? = null
-            val gate = Semaphore(if (api.sequentialMainPage) 1 else 3)
 
             coroutineScope {
-                pages.forEachIndexed { index, page ->
+                pages.forEachIndexed { index, source ->
                     launch {
-                        gate.withPermit {
-                            val result = Engine.mainPage(api, page)
-                            result.onSuccess { response ->
+                        val result = source.loadPage(1)
+                        result.onSuccess { response ->
+                            if (generation == loadGeneration) {
                                 results[index] = response.lists
-                                    .filter { it.list.isNotEmpty() }
-                                    .mapIndexed { i, list ->
-                                        HomeRow(
-                                            key = "$index-$i-${list.name}",
-                                            title = list.name.ifBlank { page.name },
-                                            items = list.list,
-                                            horizontal = list.isHorizontalImages,
-                                            pageIndex = index,
-                                            page = 1,
-                                            hasNext = response.hasNext,
-                                        )
+                                .filter { it.list.isNotEmpty() }
+                                .mapIndexed { rowIndex, list ->
+                                    val cursors = if (response.hasNext) {
+                                        listOf(HomePageCursor(source, nextPage = 2, hasNext = true))
+                                    } else {
+                                        emptyList()
                                     }
+                                    HomeRow(
+                                        key = "$index-$rowIndex-${list.name}",
+                                        title = list.name.ifBlank { source.pageData.name },
+                                        items = list.list,
+                                        horizontal = list.isHorizontalImages,
+                                        pageIndex = index,
+                                        page = 1,
+                                        hasNext = response.hasNext,
+                                        pagingSources = cursors,
+                                    )
+                                }
                                 _rows.value = results.filterNotNull().flatten()
+                                _sourceOptions.value = _rows.value.flatMap { it.items }
+                                    .associate { it.url to listOf(it) }
                             }
-                            result.onFailure { lastFailure = it.readableMessage() }
+                        }
+                        result.onFailure {
+                            if (generation == loadGeneration) lastFailure = it.readableMessage()
                         }
                     }
                 }
             }
 
-            _loading.value = false
-            if (_rows.value.isEmpty()) {
-                _error.value = lastFailure ?: ""
+            if (generation == loadGeneration) {
+                _loading.value = false
+                if (_rows.value.isEmpty()) {
+                    _error.value = lastFailure ?: ""
+                }
             }
         }
     }
@@ -247,10 +417,19 @@ fun HomeScreen(
     val sections by expandedViewModel.sections.collectAsState()
     val startupDone by PluginManager.startupDone.collectAsState()
     val sourceName by sourceViewModel.home.collectAsState()
+    val allSources by sourceViewModel.homeAll.collectAsState()
     var actionsItem by remember { mutableStateOf<SearchResponse?>(null) }
+    var sourceChoices by remember { mutableStateOf<List<SearchResponse>?>(null) }
 
-    // One direction: the source owner resolves the name, Home only loads it.
-    LaunchedEffect(sourceName) { viewModel.setSource(sourceName) }
+    val openCatalogItem: (SearchResponse) -> Unit = { item ->
+        val candidates = viewModel.sourcesFor(item)
+        if (candidates.size > 1) sourceChoices = candidates else onOpenItem(item)
+    }
+
+    // New installs see one catalogue assembled from every installed home provider.
+    LaunchedEffect(allSources, sourceName) {
+        if (allSources) viewModel.setAllSources() else viewModel.setSource(sourceName)
+    }
     // A different provider invalidates every paged section and its page indexes.
     LaunchedEffect(selected) { expandedViewModel.setProvider(selected) }
 
@@ -268,7 +447,7 @@ fun HomeScreen(
 
             // The owner is still resolving the saved source; do not show a
             // different provider's shelves in the meantime.
-            selected == null -> LoadingBox(Modifier.padding(contentPadding))
+            selected == null && !allSources -> LoadingBox(Modifier.padding(contentPadding))
 
             else -> ExpressivePullToRefresh(
                 isRefreshing = loading,
@@ -280,6 +459,7 @@ fun HomeScreen(
             ) {
                 HomeShelves(
                     selectedSource = selected,
+                    sourceLabel = if (allSources) stringResource(R.string.search_scope_all) else selected,
                     rows = rows,
                     hero = hero,
                     continueWatchingItems = continueWatchingItems,
@@ -288,23 +468,30 @@ fun HomeScreen(
                     sections = sections,
                     contentPadding = contentPadding,
                     onOpenSources = onOpenSources,
-                    onOpenItem = onOpenItem,
+                    onOpenItem = openCatalogItem,
                     onOpenDetails = onOpenDetails,
                     onResume = onResume,
                     onRetry = viewModel::retry,
                     onPosterLongClick = { actionsItem = it },
                     onViewMore = { row ->
-                        val provider = selected
-                        if (provider != null) {
-                            expandedViewModel.open(provider, row)
-                            onOpenSection()
-                        }
+                        expandedViewModel.open(selected.orEmpty(), row)
+                        onOpenSection()
                     },
                 )
             }
         }
         actionsItem?.let { item ->
             PosterActionsSheet(item = item, onDismiss = { actionsItem = null })
+        }
+        sourceChoices?.let { candidates ->
+            HomeSourceChooser(
+                candidates = candidates,
+                onSelect = { selectedItem ->
+                    sourceChoices = null
+                    onOpenItem(selectedItem)
+                },
+                onDismiss = { sourceChoices = null },
+            )
         }
     }
 }
@@ -316,6 +503,7 @@ fun HomeScreen(
 @Composable
 private fun HomeShelves(
     selectedSource: String?,
+    sourceLabel: String?,
     rows: List<HomeRow>,
     hero: List<SearchResponse>,
     continueWatchingItems: List<HistoryEntry>,
@@ -397,12 +585,12 @@ private fun HomeShelves(
             }
 
             // The provider belongs to this page, not the app shell.
-            if (selectedSource != null) {
+            if (sourceLabel != null) {
                 item(key = "source") {
                     SourceChip(
-                        label = selectedSource,
+                        label = sourceLabel,
                         onClick = onOpenSources,
-                        leading = { SourceAvatar(name = selectedSource) },
+                        leading = { SourceAvatar(name = selectedSource.orEmpty()) },
                         modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 12.dp),
                     )
                 }
@@ -468,11 +656,30 @@ private fun HomeShelves(
                 key = { _, row -> row.key },
                 contentType = { _, _ -> "shelf" },
             ) { index, row ->
-                // The expanded screen turns hasNext off when a page ends or fails,
-                // and that hides the button here without reloading Home.
-                val canViewMore = row.hasNext &&
-                    sections[sectionKey(selectedSource.orEmpty(), row.key)]?.hasNext != false
-                val viewMore: (() -> Unit)? = if (canViewMore) ({ onViewMore(row) }) else null
+                val displayTitle = when (row.catalogCategoryId) {
+                    HomeCategoryIds.MOVIES -> stringResource(R.string.home_catalog_movies)
+                    HomeCategoryIds.INDIAN_MOVIES -> stringResource(R.string.home_catalog_indian_movies)
+                    HomeCategoryIds.ASIAN_MOVIES -> stringResource(R.string.home_catalog_asian_movies)
+                    HomeCategoryIds.FOREIGN_MOVIES -> stringResource(R.string.home_catalog_foreign_movies)
+                    HomeCategoryIds.ARABIC_MOVIES -> stringResource(R.string.home_catalog_arabic_movies)
+                    HomeCategoryIds.TURKISH_MOVIES -> stringResource(R.string.home_catalog_turkish_movies)
+                    HomeCategoryIds.SERIES -> stringResource(R.string.home_catalog_series)
+                    HomeCategoryIds.ARABIC_SERIES -> stringResource(R.string.home_catalog_arabic_series)
+                    HomeCategoryIds.TURKISH_SERIES -> stringResource(R.string.home_catalog_turkish_series)
+                    HomeCategoryIds.INDIAN_SERIES -> stringResource(R.string.home_catalog_indian_series)
+                    HomeCategoryIds.ASIAN_SERIES -> stringResource(R.string.home_catalog_asian_series)
+                    HomeCategoryIds.FOREIGN_SERIES -> stringResource(R.string.home_catalog_foreign_series)
+                    HomeCategoryIds.ANIME -> stringResource(R.string.home_catalog_anime)
+                    HomeCategoryIds.ANIMATION -> stringResource(R.string.home_catalog_animation)
+                    HomeCategoryIds.DUBBED -> stringResource(R.string.home_catalog_dubbed)
+                    HomeCategoryIds.SUBTITLED -> stringResource(R.string.home_catalog_subtitled)
+                    else -> row.title
+                }
+                val displayRow = remember(row, displayTitle) { row.copy(title = displayTitle) }
+                // Each category has its own paging state, even when no provider is selected.
+                val canViewMore = displayRow.hasNext &&
+                    sections[sectionKey(selectedSource.orEmpty(), displayRow.key)]?.hasNext != false
+                val viewMore: (() -> Unit)? = if (canViewMore) ({ onViewMore(displayRow) }) else null
                 // The first three shelves rise in once; later ones just appear, and
                 // a provider switch reuses the already-settled rows.
                 if (index < 3) {
@@ -482,7 +689,7 @@ private fun HomeShelves(
                         enter = staggeredEnter(index),
                     ) {
                         Shelf(
-                            row = row,
+                            row = displayRow,
                             onOpenItem = onOpenItem,
                             onPosterLongClick = onPosterLongClick,
                             onViewMore = viewMore,
@@ -490,7 +697,7 @@ private fun HomeShelves(
                     }
                 } else {
                     Shelf(
-                        row = row,
+                        row = displayRow,
                         onOpenItem = onOpenItem,
                         onPosterLongClick = onPosterLongClick,
                         onViewMore = viewMore,
@@ -502,6 +709,60 @@ private fun HomeShelves(
                 item(key = "more") {
                     Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
                         LoadingIndicator(Modifier.size(32.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+private fun HomeSourceChooser(
+    candidates: List<SearchResponse>,
+    onSelect: (SearchResponse) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.home_choose_source_title),
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            Text(
+                text = stringResource(R.string.home_choose_source_description),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                items(candidates, key = { "${it.apiName}|${it.url}" }) { candidate ->
+                    Surface(
+                        onClick = { onSelect(candidate) },
+                        shape = MaterialTheme.shapes.medium,
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                    ) {
+                        ComposeRow(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            SourceAvatar(name = candidate.apiName)
+                            Column(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
+                                Text(candidate.apiName, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    candidate.name,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
                     }
                 }
             }

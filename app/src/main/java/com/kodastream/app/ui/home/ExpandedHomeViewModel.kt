@@ -5,6 +5,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kodastream.app.engine.Engine
 import com.lagradost.cloudstream3.SearchResponse
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,14 +27,74 @@ data class ExpandedSection(
     val horizontal: Boolean,
     val items: List<SearchResponse>,
     val loading: Boolean = false,
-    /** The last page failed; offers a retry row instead of "No more items". */
+    /** A source page failed; its cursor remains available for an explicit retry. */
     val failed: Boolean = false,
+    val sourceCursors: List<HomePageCursor> = emptyList(),
+    val catalogCategoryId: String? = null,
+    val inFlight: Int = 0,
+    val requestId: Long = 0L,
 )
 
 /**
- * Paged copies of Home sections, kept in memory and shared by Home and the
- * expanded section screen. An activity-scoped instance survives rotation and
- * returning to Home; it is dropped on a provider change or a Home refresh.
+ * Pagination progress is measured against this source's returned URLs, not
+ * the merged card count. A different source may add a new card in the same
+ * batch; that must not keep this source alive when it repeats old pages.
+ */
+internal fun hasNewSourceItems(
+    current: List<SearchResponse>,
+    incoming: List<SearchResponse>,
+): Boolean {
+    if (incoming.isEmpty()) return false
+    val currentKeys = current.asSequence().map(::homeItemKey).toHashSet()
+    return incoming.any { homeItemKey(it) !in currentKeys }
+}
+
+internal fun mergePagedItems(
+    current: List<SearchResponse>,
+    incoming: List<SearchResponse>,
+): List<SearchResponse> {
+    if (incoming.isEmpty()) return current
+    val currentIndex = current.mapIndexed { index, item -> homeItemKey(item) to index }.toMap()
+    val currentKeys = currentIndex.keys
+    val groups = deduplicateCatalog(current + incoming)
+    return groups
+        .sortedBy { group ->
+            group.sources.mapNotNull { currentIndex[homeItemKey(it)] }.minOrNull() ?: Int.MAX_VALUE
+        }
+        .map { group ->
+            // Keep already-visible cards and their order stable as new sources arrive.
+            group.sources.firstOrNull { homeItemKey(it) in currentKeys } ?: group.primary
+        }
+        .distinctBy(::homeItemKey)
+}
+
+private fun pageItemsForSection(
+    section: ExpandedSection,
+    cursor: HomePageCursor,
+    response: Engine.MainPageResult,
+): List<SearchResponse> {
+    val categoryId = section.catalogCategoryId
+    if (categoryId != null) {
+        return response.lists.flatMap { pageList ->
+            pageList.list.filter { item ->
+                categoryId in homeCategoryIdsFor(
+                    item = item,
+                    providerLanguage = cursor.source.api.lang,
+                    sourceMetadata = "${cursor.source.metadata} ${pageList.name}",
+                )
+            }
+        }
+    }
+
+    val matchingList = response.lists.firstOrNull {
+        it.name == section.title || (it.name.isBlank() && cursor.source.pageData.name == section.title)
+    } ?: response.lists.singleOrNull()
+    return matchingList?.list.orEmpty()
+}
+
+/**
+ * Paged copies of Home categories. Each category owns its own cursor state,
+ * while HomePageSource shares the actual network page cache across categories.
  */
 class ExpandedHomeViewModel : ViewModel() {
     private val _sections = MutableStateFlow<Map<String, ExpandedSection>>(emptyMap())
@@ -41,10 +104,31 @@ class ExpandedHomeViewModel : ViewModel() {
     val selected: StateFlow<String?> = _selected.asStateFlow()
 
     private var provider: String? = null
+    private var requestCounter = 0L
+    private val activeJobs = mutableMapOf<String, List<Job>>()
+    private val activeWatchdogs = mutableMapOf<String, Job>()
 
-    /** A Home refresh replaces the source lists, so every page is stale. */
+    private fun cancelSectionJobs(key: String) {
+        activeJobs.remove(key)?.forEach { it.cancel() }
+        activeWatchdogs.remove(key)?.cancel()
+        update(key) { current ->
+            if (!current.loading) current else current.copy(
+                loading = false,
+                inFlight = 0,
+                requestId = ++requestCounter,
+                hasNext = current.sourceCursors.any { it.hasNext && !it.failed },
+            )
+        }
+    }
+
+    /** A Home refresh replaces the source lists, so every page and request is stale. */
     fun reset() {
+        activeJobs.values.flatten().forEach { it.cancel() }
+        activeJobs.clear()
+        activeWatchdogs.values.forEach { it.cancel() }
+        activeWatchdogs.clear()
         _sections.value = emptyMap()
+        _selected.value = null
     }
 
     fun setProvider(name: String?) {
@@ -55,70 +139,168 @@ class ExpandedHomeViewModel : ViewModel() {
 
     fun open(providerName: String, row: HomeRow) {
         val key = sectionKey(providerName, row.key)
-        _sections.update { sections ->
-            if (sections.containsKey(key)) {
-                sections
+        val previous = _selected.value
+        if (previous != null && previous != key) {
+            cancelSectionJobs(previous)
+        }
+        _sections.update { current ->
+            if (current.containsKey(key)) {
+                current
             } else {
-                sections + (key to ExpandedSection(
+                val cursors = if (row.pagingSources.isNotEmpty()) {
+                    row.pagingSources
+                } else {
+                    // Compatibility for a row created before source cursors were attached.
+                    val api = Engine.provider(providerName)
+                    val source = api?.let { createHomePageSources(listOf(it)).getOrNull(row.pageIndex) }
+                    if (source != null && row.hasNext) {
+                        listOf(HomePageCursor(source, nextPage = row.page + 1, hasNext = true))
+                    } else {
+                        emptyList()
+                    }
+                }
+                current + (key to ExpandedSection(
                     key = key,
                     providerName = providerName,
                     title = row.title,
                     pageIndex = row.pageIndex,
                     page = row.page,
-                    hasNext = row.hasNext,
+                    hasNext = cursors.any { it.hasNext && !it.failed },
                     horizontal = row.horizontal,
-                    items = row.items.distinctBy { it.url },
+                    items = row.items.distinctBy(::homeItemKey),
+                    sourceCursors = cursors,
+                    catalogCategoryId = row.catalogCategoryId,
                 ))
             }
         }
         _selected.value = key
     }
 
-    /**
-     * Fetches the next page. One request at a time; [retry] is the only way
-     * past a failed page, because a failure also turns [ExpandedSection.hasNext] off.
-     */
+    /** Fetches one next page from each eligible source independently. */
     fun loadNext(retry: Boolean = false) {
         val key = _selected.value ?: return
         val current = _sections.value[key] ?: return
         if (current.loading) return
-        if (!current.hasNext && !(retry && current.failed)) return
-        val api = Engine.provider(current.providerName) ?: return finish(key)
-        val page = api.mainPage.getOrNull(current.pageIndex) ?: return finish(key)
 
-        update(key) { it.copy(loading = true, failed = false) }
-        viewModelScope.launch {
-            val result = Engine.mainPage(api, page, current.page + 1)
-            val response = result.getOrNull()
-            val merged = mergeSectionPage(
-                current = current.items,
-                lists = response?.lists,
-                responseHasNext = response?.hasNext == true,
-                sectionName = current.title,
+        val targets = current.sourceCursors.filter { cursor ->
+            if (retry) cursor.failed else cursor.hasNext && !cursor.failed
+        }
+        if (targets.isEmpty()) return
+
+        val requestId = ++requestCounter
+        update(key) { latest ->
+            if (latest.loading) latest else latest.copy(
+                loading = true,
+                failed = false,
+                inFlight = targets.size,
+                requestId = requestId,
+                sourceCursors = latest.sourceCursors.map { cursor ->
+                    if (targets.any { it.source.id == cursor.source.id }) cursor.copy(failed = false)
+                    else cursor
+                },
+                hasNext = latest.sourceCursors.any { cursor ->
+                    cursor.hasNext && (!cursor.failed || targets.any { it.source.id == cursor.source.id })
+                },
             )
-            update(key) { latest ->
-                if (!latest.loading) {
-                    latest
-                } else {
-                    latest.copy(
-                        items = merged.items,
-                        page = if (response == null) latest.page else latest.page + 1,
-                        hasNext = merged.hasNext,
-                        loading = false,
-                        failed = response == null,
-                    )
+        }
+
+        activeWatchdogs.remove(key)?.cancel()
+        val watchdogBudgetMs = (((targets.size + 11) / 12) * 12_000L + 5_000L)
+            .coerceAtMost(95_000L)
+        val watchdog = viewModelScope.launch {
+            kotlinx.coroutines.delay(watchdogBudgetMs)
+            val latest = _sections.value[key]
+            if (latest != null && latest.requestId == requestId && latest.loading) {
+                activeJobs[key]?.forEach { it.cancel() }
+                update(key) { state ->
+                    if (state.requestId != requestId) {
+                        state
+                    } else {
+                        val timedOutCursors = state.sourceCursors.map { existing ->
+                            val requested = targets.firstOrNull { it.source.id == existing.source.id }
+                            if (
+                                requested != null &&
+                                existing.nextPage == requested.nextPage &&
+                                !existing.failed
+                            ) existing.copy(failed = true) else existing
+                        }
+                        state.copy(
+                            sourceCursors = timedOutCursors,
+                            hasNext = timedOutCursors.any { it.hasNext && !it.failed },
+                            failed = timedOutCursors.any { it.failed },
+                            loading = false,
+                            inFlight = 0,
+                            requestId = ++requestCounter,
+                        )
+                    }
+                }
+            }
+            activeWatchdogs.remove(key)
+        }
+        activeWatchdogs[key] = watchdog
+
+        val jobs = targets.map { cursor ->
+            viewModelScope.launch(start = CoroutineStart.LAZY) {
+                val result = try {
+                    cursor.source.loadPage(cursor.nextPage)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    Result.failure(failure)
+                }
+
+                val response = result.getOrNull()
+                update(key) { latest ->
+                    if (latest.requestId != requestId) {
+                        latest
+                    } else {
+                        val incoming = response?.let { pageItemsForSection(latest, cursor, it) }.orEmpty()
+                        val sourcePageHadNewItems = hasNewSourceItems(latest.items, incoming)
+                        val mergedItems = mergePagedItems(latest.items, incoming)
+                        val updatedCursors = latest.sourceCursors.map { existing ->
+                            if (existing.source.id != cursor.source.id) {
+                                existing
+                            } else if (response == null) {
+                                existing.copy(failed = true)
+                            } else {
+                                val emptyPages = if (sourcePageHadNewItems) 0 else existing.emptyPageCount + 1
+                                existing.copy(
+                                    nextPage = cursor.nextPage + 1,
+                                    hasNext = response.hasNext && if (latest.catalogCategoryId != null) {
+                                        emptyPages < 3
+                                    } else {
+                                        sourcePageHadNewItems
+                                    },
+                                    failed = false,
+                                    emptyPageCount = emptyPages,
+                                )
+                            }
+                        }
+                        val remaining = (latest.inFlight - 1).coerceAtLeast(0)
+                        latest.copy(
+                            items = if (response == null) latest.items else mergedItems,
+                            page = if (response == null) latest.page else maxOf(latest.page, cursor.nextPage),
+                            sourceCursors = updatedCursors,
+                            hasNext = updatedCursors.any { it.hasNext && !it.failed },
+                            failed = updatedCursors.any { it.failed },
+                            inFlight = remaining,
+                            loading = remaining > 0,
+                        )
+                    }
+                }
+                val latest = _sections.value[key]
+                if (latest?.requestId == requestId && !latest.loading) {
+                    activeWatchdogs.remove(key)?.cancel()
                 }
             }
         }
-    }
-
-    private fun finish(key: String) {
-        update(key) { it.copy(hasNext = false, loading = false) }
+        activeJobs[key] = jobs
+        jobs.forEach { it.start() }
     }
 
     private fun update(key: String, block: (ExpandedSection) -> ExpandedSection) {
-        _sections.update { sections ->
-            sections[key]?.let { sections + (key to block(it)) } ?: sections
+        _sections.update { current ->
+            current[key]?.let { current + (key to block(it)) } ?: current
         }
     }
 }

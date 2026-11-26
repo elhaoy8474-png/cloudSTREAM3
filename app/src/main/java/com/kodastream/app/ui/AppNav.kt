@@ -345,6 +345,7 @@ fun AppRoot(themeViewModel: ThemeViewModel) {
     var sourceSheetOpen by remember { mutableStateOf(false) }
     val sourceList by sources.providers.collectAsState()
     val homeSource by sources.home.collectAsState()
+    val homeAll by sources.homeAll.collectAsState()
     val searchScope by sources.search.collectAsState()
 
     val setMangaSection: (Boolean) -> Unit = { enabled ->
@@ -526,17 +527,20 @@ fun AppRoot(themeViewModel: ThemeViewModel) {
         val search = route == Routes.SEARCH
         SourceSheet(
             providers = sourceList,
-            selected = if (search) searchScope else homeSource,
-            showAllSources = search,
+            selected = if (search) searchScope else if (homeAll) null else homeSource,
+            showAllSources = true,
             onSelect = { name ->
                 sourceSheetOpen = false
-                if (search) sources.selectSearch(name) else if (name != null) sources.selectHome(name)
+                if (search) sources.selectSearch(name)
+                else if (name == null) sources.selectAllHomeSources()
+                else sources.selectHome(name)
             },
             onOpenExtensions = {
                 sourceSheetOpen = false
                 navController.navigateTopLevel(Routes.EXTENSIONS)
             },
             onDismiss = { sourceSheetOpen = false },
+            allowProvidersWithoutHome = search,
         )
     }
 }

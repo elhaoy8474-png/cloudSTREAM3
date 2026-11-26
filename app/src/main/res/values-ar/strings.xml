@@ -1102,4 +1102,23 @@
     <string name="skip_type_intro">المقدمة</string>
     <string name="skip_type_preview">المعاينة</string>
     <string name="skip_type_format" formatted="true">تخطي %s</string>
+    <string name="home_choose_source_title">اختر مصدر المشاهدة</string>
+    <string name="home_choose_source_description">هذا العمل متاح في أكثر من إضافة. اختر الإضافة التي تريد فتحه من خلالها.</string>
+    <string name="home_all_sources_timeout">بعض المصادر لم تستجب في الوقت المحدد. ستظل النتائج التي وصلت متاحة.</string>
+    <string name="home_catalog_movies">أفلام</string>
+    <string name="home_catalog_indian_movies">أفلام هندية</string>
+    <string name="home_catalog_asian_movies">أفلام آسيوية</string>
+    <string name="home_catalog_foreign_movies">أفلام أجنبية</string>
+    <string name="home_catalog_arabic_movies">أفلام عربية</string>
+    <string name="home_catalog_turkish_movies">أفلام تركية</string>
+    <string name="home_catalog_series">مسلسلات</string>
+    <string name="home_catalog_arabic_series">مسلسلات عربية</string>
+    <string name="home_catalog_turkish_series">مسلسلات تركية</string>
+    <string name="home_catalog_indian_series">مسلسلات هندية</string>
+    <string name="home_catalog_asian_series">مسلسلات آسيوية</string>
+    <string name="home_catalog_foreign_series">مسلسلات أجنبية</string>
+    <string name="home_catalog_anime">أنمي</string>
+    <string name="home_catalog_animation">رسوم متحركة</string>
+    <string name="home_catalog_dubbed">مدبلج</string>
+    <string name="home_catalog_subtitled">مترجم</string>
 </resources>

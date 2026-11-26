@@ -1199,4 +1199,23 @@
     <string name="player_preferred_audio_lang_summary">Default language track when multiple are available</string>
     <string name="player_subtitles_style">Subtitle appearance</string>
     <string name="player_subtitles_style_summary">Customize subtitle font, size, colors, and background</string>
+    <string name="home_choose_source_title">Choose a source</string>
+    <string name="home_choose_source_description">This title is available from more than one extension. Choose where to open it.</string>
+    <string name="home_all_sources_timeout">Some sources did not respond in time. The results received so far are still available.</string>
+    <string name="home_catalog_movies">Movies</string>
+    <string name="home_catalog_indian_movies">Indian Movies</string>
+    <string name="home_catalog_asian_movies">Asian Movies</string>
+    <string name="home_catalog_foreign_movies">Foreign Movies</string>
+    <string name="home_catalog_arabic_movies">Arabic Movies</string>
+    <string name="home_catalog_turkish_movies">Turkish Movies</string>
+    <string name="home_catalog_series">Series</string>
+    <string name="home_catalog_arabic_series">Arabic Series</string>
+    <string name="home_catalog_turkish_series">Turkish Series</string>
+    <string name="home_catalog_indian_series">Indian Series</string>
+    <string name="home_catalog_asian_series">Asian Series</string>
+    <string name="home_catalog_foreign_series">Foreign Series</string>
+    <string name="home_catalog_anime">Anime</string>
+    <string name="home_catalog_animation">Animation</string>
+    <string name="home_catalog_dubbed">Dubbed</string>
+    <string name="home_catalog_subtitled">Subtitled</string>
 </resources>

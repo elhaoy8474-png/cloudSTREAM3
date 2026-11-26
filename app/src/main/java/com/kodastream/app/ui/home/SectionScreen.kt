@@ -67,6 +67,7 @@ fun SectionScreen(
     }
 
     val gridState = rememberLazyGridState()
+    val visibleItems = remember(section.items) { section.items.distinctBy(::homeItemKey) }
     var actionsItem by remember { mutableStateOf<SearchResponse?>(null) }
     val longClickLabel = stringResource(R.string.cd_poster_actions)
     val nearEnd by remember {
@@ -122,7 +123,7 @@ fun SectionScreen(
                 .fillMaxSize()
                 .navigationBarsPadding(),
         ) {
-            items(section.items, key = { it.url }) { item ->
+            items(visibleItems, key = { homeItemKey(it) }) { item ->
                 PosterCard(
                     item = item,
                     onClick = { onOpenItem(item) },
