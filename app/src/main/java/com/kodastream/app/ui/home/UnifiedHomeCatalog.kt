@@ -235,9 +235,9 @@ internal fun homePotentialCategoryIds(
     if (anime) ids += HomeCategoryIds.ANIME
     val classificationText = "${source.metadata} $additionalMetadata".lowercase(Locale.ROOT)
     val mayContainDubbed = anime ||
-        Regex("""\\b(dub|dubbed|dubbing)\\b|مدبلج|مدبلجة|دبلجة""").containsMatchIn(classificationText)
+        Regex("""\b(dub|dubbed|dubbing)\b|مدبلج|مدبلجة|دبلجة""").containsMatchIn(classificationText)
     val mayContainSubtitled = anime ||
-        Regex("""\\b(sub|subbed|subtitled|subtitle|subtitles)\\b|مترجم|مترجمة|ترجمة""").containsMatchIn(classificationText)
+        Regex("""\b(sub|subbed|subtitled|subtitle|subtitles)\b|مترجم|مترجمة|ترجمة""").containsMatchIn(classificationText)
     if (mayContainDubbed) ids += HomeCategoryIds.DUBBED
     if (mayContainSubtitled) ids += HomeCategoryIds.SUBTITLED
     return ids
