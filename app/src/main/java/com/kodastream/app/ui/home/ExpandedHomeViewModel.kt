@@ -45,26 +45,27 @@ internal fun hasNewSourceItems(
     incoming: List<SearchResponse>,
 ): Boolean {
     if (incoming.isEmpty()) return false
-    val currentUrls = current.asSequence().map { it.url }.toHashSet()
-    return incoming.any { it.url !in currentUrls }
+    val currentKeys = current.asSequence().map(::homeItemKey).toHashSet()
+    return incoming.any { homeItemKey(it) !in currentKeys }
 }
 
-private fun mergePagedItems(
+internal fun mergePagedItems(
     current: List<SearchResponse>,
     incoming: List<SearchResponse>,
 ): List<SearchResponse> {
     if (incoming.isEmpty()) return current
-    val currentIndex = current.mapIndexed { index, item -> item.url to index }.toMap()
-    val currentUrls = currentIndex.keys
+    val currentIndex = current.mapIndexed { index, item -> homeItemKey(item) to index }.toMap()
+    val currentKeys = currentIndex.keys
     val groups = deduplicateCatalog(current + incoming)
     return groups
         .sortedBy { group ->
-            group.sources.mapNotNull { currentIndex[it.url] }.minOrNull() ?: Int.MAX_VALUE
+            group.sources.mapNotNull { currentIndex[homeItemKey(it)] }.minOrNull() ?: Int.MAX_VALUE
         }
         .map { group ->
             // Keep already-visible cards and their order stable as new sources arrive.
-            group.sources.firstOrNull { it.url in currentUrls } ?: group.primary
+            group.sources.firstOrNull { homeItemKey(it) in currentKeys } ?: group.primary
         }
+        .distinctBy(::homeItemKey)
 }
 
 private fun pageItemsForSection(
@@ -166,7 +167,7 @@ class ExpandedHomeViewModel : ViewModel() {
                     page = row.page,
                     hasNext = cursors.any { it.hasNext && !it.failed },
                     horizontal = row.horizontal,
-                    items = row.items.distinctBy { it.url },
+                    items = row.items.distinctBy(::homeItemKey),
                     sourceCursors = cursors,
                     catalogCategoryId = row.catalogCategoryId,
                 ))

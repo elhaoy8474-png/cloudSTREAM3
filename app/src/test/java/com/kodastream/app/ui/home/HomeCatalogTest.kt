@@ -292,4 +292,82 @@ class HomeCatalogTest {
         )
     }
 
+
+    @Test
+    fun categoryRowsDoNotRepeatOneProvidersUrlWhenItAppearsUnderDifferentTitles() {
+        val provider = object : MainAPI() {
+            init {
+                name = "First"
+                mainUrl = "https://first.example"
+                sourcePlugin = "test/first"
+                lang = "en"
+            }
+            override val hasMainPage = true
+            override val mainPage = listOf(MainPageData("Movies", "/movies"))
+        }
+        val source = createHomePageSources(listOf(provider)).single()
+        val accumulator = UnifiedHomeCatalogAccumulator()
+        accumulator.addPage(
+            source,
+            Engine.MainPageResult(
+                listOf(
+                    HomePageList("Movies", listOf(movie("Film One", "First", "same-route"))),
+                    HomePageList("More", listOf(movie("Unrelated Title", "First", "same-route"))),
+                ),
+                false,
+            ),
+        )
+
+        val movies = accumulator.snapshot().rows.single { it.catalogCategoryId == HomeCategoryIds.MOVIES }
+        assertEquals(1, movies.items.size)
+        assertEquals(movies.items.size, movies.items.map(::homeItemKey).distinct().size)
+    }
+
+    @Test
+    fun sectionPageMergeDeduplicatesOneProvidersUrlEvenWhenTitlesDiffer() {
+        val existing = movie("Film One", "Provider A", "same-route")
+        val incoming = movie("A Completely Different Name", "Provider A", "same-route")
+
+        val merged = mergePagedItems(listOf(existing), listOf(incoming))
+
+        assertEquals(1, merged.size)
+        assertEquals(listOf(homeItemKey(existing)), merged.map(::homeItemKey))
+    }
+
+    @Test
+    fun genericMovieSourcesAreNotAssumedToHaveDubbedOrSubtitledPages() {
+        val provider = object : MainAPI() {
+            init {
+                name = "Generic Movies"
+                mainUrl = "https://generic.example"
+                sourcePlugin = "test/generic"
+                lang = "en"
+            }
+            override val hasMainPage = true
+            override val mainPage = listOf(MainPageData("Movies", "/movies"))
+        }
+        val source = createHomePageSources(listOf(provider)).single()
+
+        val eligible = homePotentialCategoryIds(source)
+
+        assertFalse(HomeCategoryIds.DUBBED in eligible)
+        assertFalse(HomeCategoryIds.SUBTITLED in eligible)
+    }
+
+    @Test
+    fun explicitlyDubbedSourcesRemainEligibleForTheDubbedCategory() {
+        val provider = object : MainAPI() {
+            init {
+                name = "Dubbed Movies"
+                mainUrl = "https://dubbed.example"
+                sourcePlugin = "test/dubbed"
+                lang = "en"
+            }
+            override val hasMainPage = true
+            override val mainPage = listOf(MainPageData("Movies", "/movies"))
+        }
+        val source = createHomePageSources(listOf(provider)).single()
+
+        assertTrue(HomeCategoryIds.DUBBED in homePotentialCategoryIds(source))
+    }
 }

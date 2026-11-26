@@ -39,6 +39,9 @@ internal object HomeCategoryIds {
 
 internal data class HomeCatalogCategory(val id: String, val title: String, val order: Int)
 
+/** Stable identity for a playable result; relative URLs can repeat across providers. */
+internal fun homeItemKey(item: SearchResponse): String = "${item.apiName}\u001F${item.url}"
+
 internal val homeCatalogCategories = listOf(
     HomeCatalogCategory(HomeCategoryIds.MOVIES, "Movies", 0),
     HomeCatalogCategory(HomeCategoryIds.INDIAN_MOVIES, "Indian Movies", 1),
@@ -230,10 +233,13 @@ internal fun homePotentialCategoryIds(
         if (TvType.Cartoon in source.api.supportedTypes) ids += HomeCategoryIds.ANIMATION
     }
     if (anime) ids += HomeCategoryIds.ANIME
-    if (movies || series || anime) {
-        ids += HomeCategoryIds.DUBBED
-        ids += HomeCategoryIds.SUBTITLED
-    }
+    val classificationText = "${source.metadata} $additionalMetadata".lowercase(Locale.ROOT)
+    val mayContainDubbed = anime ||
+        Regex("""\\b(dub|dubbed|dubbing)\\b|مدبلج|مدبلجة|دبلجة""").containsMatchIn(classificationText)
+    val mayContainSubtitled = anime ||
+        Regex("""\\b(sub|subbed|subtitled|subtitle|subtitles)\\b|مترجم|مترجمة|ترجمة""").containsMatchIn(classificationText)
+    if (mayContainDubbed) ids += HomeCategoryIds.DUBBED
+    if (mayContainSubtitled) ids += HomeCategoryIds.SUBTITLED
     return ids
 }
 
@@ -322,10 +328,24 @@ internal class UnifiedHomeCatalogAccumulator {
     private class CategoryBucket {
         val groups = mutableListOf<Group>()
         val ngramIndex = HashMap<String, MutableList<Int>>()
+        val itemGroups = HashMap<String, Int>()
 
         fun add(entry: RankedSearchResponse) {
             val title = normalizeCatalogTitle(entry.item.name)
             if (title.isBlank() || entry.item.url.isBlank()) return
+            val itemKey = homeItemKey(entry.item)
+            val existingGroupIndex = itemGroups[itemKey]
+            if (existingGroupIndex != null) {
+                val group = groups[existingGroupIndex]
+                val memberIndex = group.members.indexOfFirst { homeItemKey(it.item) == itemKey }
+                if (memberIndex >= 0 && entry.order < group.members[memberIndex].order) {
+                    group.members[memberIndex] = entry
+                    titleNgrams(title).forEach { ngram ->
+                        ngramIndex.getOrPut(ngram) { mutableListOf() }.add(existingGroupIndex)
+                    }
+                }
+                return
+            }
             val candidates = linkedSetOf<Int>()
             titleNgrams(title).forEach { ngram -> ngramIndex[ngram]?.let(candidates::addAll) }
             val matchIndex = candidates.sortedBy { groups[it].primary.order }
@@ -334,17 +354,19 @@ internal class UnifiedHomeCatalogAccumulator {
             if (matchIndex == null) {
                 val index = groups.size
                 groups += Group(entry)
+                itemGroups[itemKey] = index
                 titleNgrams(title).forEach { ngram ->
                     ngramIndex.getOrPut(ngram) { mutableListOf() }.add(index)
                 }
             } else {
                 val group = groups[matchIndex]
-                if (group.members.none { it.item.apiName == entry.item.apiName && it.item.url == entry.item.url }) {
+                if (group.members.none { homeItemKey(it.item) == itemKey }) {
                     group.members += entry
                     titleNgrams(title).forEach { ngram ->
                         ngramIndex.getOrPut(ngram) { mutableListOf() }.add(matchIndex)
                     }
                 }
+                itemGroups[itemKey] = matchIndex
             }
         }
 
@@ -410,7 +432,7 @@ internal class UnifiedHomeCatalogAccumulator {
                 val groupItems = group.members.sortedBy { it.order }.map { it.item }
                 groupItems.forEach { alternatives[it.url] = groupItems }
                 groupItems.first()
-            }
+            }.distinctBy(::homeItemKey)
             HomeRow(
                 key = "catalog-${category.id}",
                 title = category.title,
